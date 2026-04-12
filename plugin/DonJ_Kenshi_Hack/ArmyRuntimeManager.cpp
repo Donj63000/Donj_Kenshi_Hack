@@ -1,3 +1,4 @@
+#include "ArmyDiagnostics.h"
 #include "ArmyRuntimeManager.h"
 
 #include <algorithm>
@@ -19,6 +20,14 @@ namespace
         const float dz = a.z - b.z;
         return (dx * dx) + (dy * dy) + (dz * dz);
     }
+
+    void TraceDebug(const ArmyRuntimeEnvironment& environment, const std::string& message)
+    {
+        if (environment.traceDebug)
+        {
+            environment.traceDebug(message);
+        }
+    }
 }
 
 void ArmyRuntimeManager::SetEnvironment(const ArmyRuntimeEnvironment& environment)
@@ -31,6 +40,7 @@ bool ArmyRuntimeManager::IsConfigured() const
     return
         static_cast<bool>(environment_.isGameLoaded) &&
         static_cast<bool>(environment_.resolveLeader) &&
+        static_cast<bool>(environment_.resolveLeaderHandleId) &&
         static_cast<bool>(environment_.resolveCurrentPlayerPlatoon) &&
         static_cast<bool>(environment_.resolveActivePlatoon) &&
         static_cast<bool>(environment_.resolvePlayerFaction) &&
@@ -51,18 +61,37 @@ bool ArmyRuntimeManager::IsConfigured() const
 
 bool ArmyRuntimeManager::CaptureLeaderContext(ArmySession& session) const
 {
+    TraceDebug(
+        environment_,
+        std::string("[TRACE] ArmyRuntimeManager::CaptureLeaderContext entree | ") +
+            BuildArmySessionDebugLine(session));
+
     Character* leader = environment_.resolveLeader();
     if (leader == nullptr)
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::CaptureLeaderContext echec : leader nul.");
         return false;
     }
 
-    session.leaderHandleId = environment_.getCharacterHandleId(leader);
+    session.leaderHandleId = environment_.resolveLeaderHandleId();
+    if (session.leaderHandleId == 0)
+    {
+        session.leaderHandleId = environment_.getCharacterHandleId(leader);
+    }
+    if (session.leaderHandleId == 0)
+    {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::CaptureLeaderContext echec : handle leader nul.");
+        return false;
+    }
 
     Platoon* playerPlatoon = environment_.resolveCurrentPlayerPlatoon();
     session.leaderPlatoonHandleId = environment_.getPlatoonHandleId(playerPlatoon);
     session.escortRefreshAccumulator = 0.0f;
-    return session.leaderHandleId != 0;
+    TraceDebug(
+        environment_,
+        std::string("[TRACE] ArmyRuntimeManager::CaptureLeaderContext succes | ") +
+            BuildArmySessionDebugLine(session));
+    return true;
 }
 
 bool ArmyRuntimeManager::ConfigureSpawnedUnit(ArmySession& session, const SpawnRequest& request, Character* character)
@@ -188,14 +217,37 @@ void ArmyRuntimeManager::Tick(ArmySession& session, float deltaSeconds)
         return;
     }
 
+    if (session.state == ArmyState::Spawning || session.state == ArmyState::Dismissing || session.leaderHandleId == 0)
+    {
+        char traceBuffer[768] = {};
+        std::snprintf(
+            traceBuffer,
+            sizeof(traceBuffer),
+            "[TRACE] ArmyRuntimeManager::Tick entree | dt=%.3f | %s",
+            static_cast<double>(deltaSeconds),
+            BuildArmySessionDebugLine(session).c_str());
+        TraceDebug(environment_, traceBuffer);
+    }
+
     if (session.state == ArmyState::Dismissing)
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::Tick : finalisation immediate du dismiss.");
         FinalizeDismiss(session);
+        return;
+    }
+
+    if (session.state == ArmyState::Spawning &&
+        session.spawnedCount == 0 &&
+        session.activeUnits.empty() &&
+        session.activeUnitHandleIds.empty())
+    {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::Tick : attente passive, aucune unite materialisee pour l'instant.");
         return;
     }
 
     if (!environment_.isGameLoaded())
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::Tick : partie non chargee, dismiss defensif.");
         BeginDismiss(session, "partie rechargee ou monde incoherent.");
         FinalizeDismiss(session);
         return;
@@ -204,6 +256,7 @@ void ArmyRuntimeManager::Tick(ArmySession& session, float deltaSeconds)
     Character* leader = nullptr;
     if (!IsLeaderContextStillValid(session, leader))
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::Tick : contexte leader invalide.");
         BeginDismiss(session, "leader introuvable, KO ou escouade changee.");
         FinalizeDismiss(session);
         return;
@@ -212,6 +265,7 @@ void ArmyRuntimeManager::Tick(ArmySession& session, float deltaSeconds)
     PruneInactiveUnits(session);
     if (session.spawnedCount > 0 && session.pendingRequestCount == 0 && session.activeUnitHandleIds.empty())
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::Tick : plus aucune unite valide, dismiss defensif.");
         BeginDismiss(session, "toutes les invocations ont disparu avant la fin du timer.");
         FinalizeDismiss(session);
         return;
@@ -219,6 +273,10 @@ void ArmyRuntimeManager::Tick(ArmySession& session, float deltaSeconds)
 
     if (session.activeUnits.empty())
     {
+        if (session.state == ArmyState::Spawning)
+        {
+            TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::Tick : aucune unite active, attente de materialisation.");
+        }
         return;
     }
 
@@ -236,17 +294,20 @@ bool ArmyRuntimeManager::IsLeaderContextStillValid(ArmySession& session, Charact
 {
     if (session.leaderHandleId == 0 && !CaptureLeaderContext(session))
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::IsLeaderContextStillValid echec : impossible de capturer le leader.");
         return false;
     }
 
     leader = environment_.resolveCharacterHandleId(session.leaderHandleId);
     if (leader == nullptr)
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::IsLeaderContextStillValid echec : leader non resolu depuis le handle.");
         return false;
     }
 
     if (environment_.isCharacterDead(leader) || environment_.isCharacterUnconscious(leader))
     {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::IsLeaderContextStillValid echec : leader mort ou KO.");
         return false;
     }
 
@@ -256,10 +317,15 @@ bool ArmyRuntimeManager::IsLeaderContextStillValid(ArmySession& session, Charact
         const ArmyHandleId currentPlatoonHandleId = environment_.getPlatoonHandleId(currentPlatoon);
         if (currentPlatoonHandleId == 0 || currentPlatoonHandleId != session.leaderPlatoonHandleId)
         {
+            TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::IsLeaderContextStillValid echec : platoon courant different.");
             return false;
         }
     }
 
+    if (session.state == ArmyState::Spawning && session.activeUnits.empty())
+    {
+        TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::IsLeaderContextStillValid succes pendant le spawn.");
+    }
     return true;
 }
 
@@ -351,6 +417,13 @@ void ArmyRuntimeManager::BeginDismiss(ArmySession& session, const std::string& r
     {
         environment_.logInfo(std::string("[INFO] Invocation dissoute : ") + reason);
     }
+
+    TraceDebug(
+        environment_,
+        std::string("[TRACE] ArmyRuntimeManager::BeginDismiss | raison=") +
+            reason +
+            " | " +
+            BuildArmySessionDebugLine(session));
 }
 
 void ArmyRuntimeManager::FinalizeDismiss(ArmySession& session)
@@ -361,4 +434,5 @@ void ArmyRuntimeManager::FinalizeDismiss(ArmySession& session)
     }
 
     ResetArmySession(session);
+    TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::FinalizeDismiss : session reinitialisee.");
 }

@@ -40,6 +40,8 @@ struct ArmyRuntimeEnvironment
     std::function<void(Character*)> rethinkAi;
     std::function<void(const std::string&)> logInfo = [](const std::string&) {};
     std::function<void(const std::string&)> logError = [](const std::string&) {};
+    std::function<void(const std::string&)> traceDebug = [](const std::string&) {};
+    std::function<ArmyHandleId()> resolveLeaderHandleId = []() { return static_cast<ArmyHandleId>(0); };
 };
 
 class ArmyRuntimeManager

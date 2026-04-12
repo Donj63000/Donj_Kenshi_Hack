@@ -26,7 +26,8 @@ enum class SpawnAttemptOutcome
     FailedTemplateMissing,
     FailedFactionUnavailable,
     FailedSpawnOriginUnavailable,
-    FailedFactoryCall
+    FailedFactoryCall,
+    FailedFactoryCallFatal
 };
 
 struct SpawnAttemptResult
@@ -57,6 +58,7 @@ struct SpawnManagerEnvironment
     std::function<bool(ArmySession&, const SpawnRequest&, Character*)> onUnitSpawned;
     std::function<void(const std::string&)> logInfo = [](const std::string&) {};
     std::function<void(const std::string&)> logError = [](const std::string&) {};
+    std::function<void(const std::string&)> traceDebug = [](const std::string&) {};
 };
 
 class SpawnManager

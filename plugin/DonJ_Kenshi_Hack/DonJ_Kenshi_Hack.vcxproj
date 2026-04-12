@@ -94,6 +94,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ArmySession.h" />
+    <ClInclude Include="ArmyDiagnostics.h" />
     <ClInclude Include="ArmyCommandSpec.h" />
     <ClInclude Include="ArmyRuntimeManager.h" />
     <ClInclude Include="CommandRegistry.h" />

@@ -45,6 +45,7 @@ struct ArmyCommandEnvironment
     std::function<bool()> hasResolvableLeader = []() { return true; };
     std::function<bool()> areArmyTemplatesAvailable = []() { return true; };
     std::function<bool()> isSpawnSystemReady = []() { return true; };
+    std::function<void(const std::string&)> debugTrace = [](const std::string&) {};
 };
 
 class TerminalBackend

@@ -2,6 +2,18 @@
 
 Mod **Kenshi Steam** en cours de developpement qui ajoute une fenetre native in-game nommee **`DonJ Kenshi Hack`** avec un terminal de commandes.
 
+## Important
+
+**Etat public actuel : ce projet est encore en construction et comporte encore des bugs.**
+
+Il peut etre montre, teste et inspecte, mais il ne faut **pas** encore le considerer comme un mod stable ou finalise.
+
+Point sensible actuel :
+
+- la commande **`/army`** et son pipeline de spawn runtime sont encore en phase de debug/stabilisation
+- des crashes en jeu peuvent encore se produire pendant les tests
+- le depot est publie aussi pour faciliter la relecture et l'aide au debug
+
 Le projet vise un MVP tres precis :
 
 - ajouter une fenetre UI native dans Kenshi

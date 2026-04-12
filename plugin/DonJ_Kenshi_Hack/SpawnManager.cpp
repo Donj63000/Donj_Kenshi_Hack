@@ -1,3 +1,4 @@
+#include "ArmyDiagnostics.h"
 #include "SpawnManager.h"
 
 #include <algorithm>
@@ -19,6 +20,14 @@ namespace
         char buffer[256] = {};
         std::snprintf(buffer, sizeof(buffer), format, valueA, valueB);
         writer(buffer);
+    }
+
+    void TraceDebug(const SpawnManagerEnvironment& environment, const std::string& message)
+    {
+        if (environment.traceDebug)
+        {
+            environment.traceDebug(message);
+        }
     }
 }
 
@@ -110,6 +119,19 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
     const float safeDeltaSeconds = std::max(deltaSeconds, 0.0f);
     reminderAccumulator_ += safeDeltaSeconds;
 
+    if (session.state == ArmyState::Spawning || !spawnQueue_.empty() || !session.pendingRequests.empty())
+    {
+        char traceBuffer[768] = {};
+        std::snprintf(
+            traceBuffer,
+            sizeof(traceBuffer),
+            "[TRACE] SpawnManager::Tick entree | dt=%.3f | queue_interne=%zu | %s",
+            static_cast<double>(safeDeltaSeconds),
+            spawnQueue_.size(),
+            BuildArmySessionDebugLine(session).c_str());
+        TraceDebug(environment_, traceBuffer);
+    }
+
     if (session.state != ArmyState::Spawning)
     {
         SyncPendingCount(session);
@@ -118,7 +140,15 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
 
     if (!spawnQueue_.empty() || !session.pendingRequests.empty())
     {
+        TraceDebug(
+            environment_,
+            std::string("[TRACE] SpawnManager::Tick adoption requetes | ") +
+                BuildArmySessionDebugLine(session));
         AdoptSessionRequests(session);
+        TraceDebug(
+            environment_,
+            std::string("[TRACE] SpawnManager::Tick adoption terminee | ") +
+                BuildArmySessionDebugLine(session));
     }
 
     SyncPendingCount(session);
@@ -144,11 +174,13 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
 
     if (!environment_.isGameLoaded())
     {
+        TraceDebug(environment_, "[TRACE] SpawnManager::Tick stop : partie non chargee.");
         return 0;
     }
 
     if (!environment_.isFactoryAvailable())
     {
+        TraceDebug(environment_, "[TRACE] SpawnManager::Tick stop : factory Kenshi indisponible.");
         if (reminderAccumulator_ >= config_.reminderIntervalSeconds)
         {
             environment_.logInfo("[INFO] Spawn differe : factory Kenshi indisponible.");
@@ -160,6 +192,7 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
     if (!environment_.isReplayHookInstalled())
     {
         session.waitingForReplayOpportunity = true;
+        TraceDebug(environment_, "[TRACE] SpawnManager::Tick stop : replay hook non installe.");
         LogDeferredReplayHint();
         return 0;
     }
@@ -183,6 +216,7 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
         {
             session.waitingForReplayOpportunity = true;
             ++session.deferredSpawnAttempts;
+            TraceDebug(environment_, "[TRACE] SpawnManager::Tick stop : aucune opportunite de replay native sur ce tick.");
             LogDeferredReplayHint();
             break;
         }
@@ -191,6 +225,13 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
         spawnQueue_.pop_front();
         SyncPendingCount(session);
         ++session.totalSpawnAttempts;
+
+        TraceDebug(
+            environment_,
+            std::string("[TRACE] SpawnManager::Tick tentative | ") +
+                BuildSpawnRequestDebugLine(request) +
+                " | " +
+                BuildArmySessionDebugLine(session));
 
         void* templateHandle = environment_.resolveTemplate(request.templateName);
         if (templateHandle == nullptr)
@@ -212,6 +253,7 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
         {
             ++session.deferredSpawnAttempts;
             spawnQueue_.push_front(request);
+            TraceDebug(environment_, "[TRACE] SpawnManager::Tick defer : faction joueur nulle.");
             environment_.logInfo("[INFO] Spawn differe : faction joueur indisponible.");
             break;
         }
@@ -221,14 +263,23 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
         {
             ++session.deferredSpawnAttempts;
             spawnQueue_.push_front(request);
+            TraceDebug(environment_, "[TRACE] SpawnManager::Tick defer : position de spawn introuvable.");
             environment_.logInfo("[INFO] Spawn differe : position de spawn introuvable.");
             break;
         }
+
+        TraceDebug(
+            environment_,
+            std::string("[TRACE] SpawnManager::Tick origine resolue | ") +
+                BuildSpawnRequestDebugLine(request) +
+                " | position=" +
+                BuildSpawnPositionDebugLine(spawnOrigin));
 
         if (!environment_.trySpawnThroughFactory)
         {
             ++session.deferredSpawnAttempts;
             spawnQueue_.push_front(request);
+            TraceDebug(environment_, "[TRACE] SpawnManager::Tick defer : callback factory absente.");
             environment_.logInfo("[INFO] Spawn differe : callback factory Kenshi absente.");
             break;
         }
@@ -238,6 +289,14 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
             templateHandle,
             playerFaction,
             spawnOrigin);
+
+        TraceDebug(
+            environment_,
+            std::string("[TRACE] SpawnManager::Tick resultat | outcome=") +
+                ToString(result.outcome) +
+                " | requeue=" +
+                (result.shouldRequeue ? "yes" : "no") +
+                (result.detail.empty() ? "" : " | detail=" + result.detail));
 
         switch (result.outcome)
         {
@@ -290,6 +349,29 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
                 environment_.logError(result.detail);
             }
             break;
+
+        case SpawnAttemptOutcome::FailedFactoryCallFatal:
+            ++session.failedSpawnAttempts;
+            spawnQueue_.clear();
+            session.pendingRequests.clear();
+            session.pendingRequestCount = 0;
+            session.waitingForReplayOpportunity = false;
+            session.active = false;
+            session.remainingSeconds = 0.0f;
+            session.state = ArmyState::Dismissing;
+            if (!result.detail.empty())
+            {
+                environment_.logError(result.detail);
+            }
+            else
+            {
+                environment_.logError("[ERREUR] Spawn factory fatal : l'invocation est interrompue pour proteger la partie.");
+            }
+            TraceDebug(
+                environment_,
+                std::string("[TRACE] SpawnManager::Tick fatal factory error | ") +
+                    BuildArmySessionDebugLine(session));
+            return spawnedThisTick;
         }
 
         SyncPendingCount(session);
@@ -309,6 +391,14 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
             "[OK] Armee active pour %d secondes.",
             static_cast<int>(session.durationSeconds));
         environment_.logInfo(buffer);
+    }
+
+    if (session.state == ArmyState::Spawning || session.state == ArmyState::Active)
+    {
+        TraceDebug(
+            environment_,
+            std::string("[TRACE] SpawnManager::Tick sortie | ") +
+                BuildArmySessionDebugLine(session));
     }
 
     return spawnedThisTick;

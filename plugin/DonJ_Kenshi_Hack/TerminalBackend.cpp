@@ -1,7 +1,9 @@
+#include "ArmyDiagnostics.h"
 #include "TerminalBackend.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <sstream>
 
 namespace
@@ -23,9 +25,17 @@ namespace
             << ", echecs=" << session.failedSpawnAttempts
             << ", leader=" << (session.leaderHandleId != 0 ? "verrouille" : "non_lie")
             << ", faction=" << (session.factionBootstrappedFromLeader ? "bootstrap_leader" : "player")
-            << ", mode_spawn=" << (session.waitingForReplayOpportunity ? "attente replay" : "pret")
+            << ", mode_spawn=" << (session.waitingForReplayOpportunity ? "attente_factory" : "pret")
             << ", temps restant=" << static_cast<int>(session.remainingSeconds) << "s.";
         return builder.str();
+    }
+
+    void TraceDebug(const ArmyCommandEnvironment& environment, const std::string& message)
+    {
+        if (environment.debugTrace)
+        {
+            environment.debugTrace(message);
+        }
     }
 }
 
@@ -172,6 +182,12 @@ bool TerminalBackend::SubmitCurrentInput()
 
     AppendOutputLine("> " + line);
     QueuePendingCommand({ line });
+    TraceDebug(
+        armyEnvironment_,
+        std::string("[TRACE] TerminalBackend::SubmitCurrentInput | line=") +
+            line +
+            " | pending_ui=" +
+            std::to_string(pendingCommands_.size()));
     return true;
 }
 
@@ -269,6 +285,19 @@ void TerminalBackend::TickGameplay(float deltaSeconds)
 {
     const float safeDeltaSeconds = std::max(deltaSeconds, 0.0f);
 
+    if (!gameplayCommandQueue_.empty() || armySession_.state != ArmyState::Idle)
+    {
+        char traceBuffer[768] = {};
+        std::snprintf(
+            traceBuffer,
+            sizeof(traceBuffer),
+            "[TRACE] TerminalBackend::TickGameplay entree | dt=%.3f | pending_gameplay=%zu | %s",
+            static_cast<double>(safeDeltaSeconds),
+            gameplayCommandQueue_.size(),
+            BuildArmySessionDebugLine(armySession_).c_str());
+        TraceDebug(armyEnvironment_, traceBuffer);
+    }
+
     while (!gameplayCommandQueue_.empty())
     {
         const GameplayCommand command = gameplayCommandQueue_.front();
@@ -277,6 +306,14 @@ void TerminalBackend::TickGameplay(float deltaSeconds)
     }
 
     TickArmySession(safeDeltaSeconds);
+
+    if (armySession_.state != ArmyState::Idle)
+    {
+        TraceDebug(
+            armyEnvironment_,
+            std::string("[TRACE] TerminalBackend::TickGameplay sortie | ") +
+                BuildArmySessionDebugLine(armySession_));
+    }
 }
 
 bool TerminalBackend::ConsumeOutputDirty()
@@ -379,6 +416,10 @@ void TerminalBackend::RegisterBuiltinCommands()
             context.writeLine("[INFO] Le spawn passera uniquement par une voie de factory Kenshi.");
             context.writeLine("[INFO] Les messages de progression et de fin seront publies par le game tick.");
             context.writeLine(BuildArmyStatusLine(session));
+            TraceDebug(
+                armyEnvironment_,
+                std::string("[TRACE] Commande /army preparee | ") +
+                    BuildArmySessionDebugLine(session));
         } });
 }
 
@@ -455,6 +496,12 @@ void TerminalBackend::ExecuteLine(const std::string& line)
 void TerminalBackend::QueueGameplayCommand(const GameplayCommand& command)
 {
     gameplayCommandQueue_.push_back(command);
+    TraceDebug(
+        armyEnvironment_,
+        std::string("[TRACE] TerminalBackend::QueueGameplayCommand | type=") +
+            (command.type == GameplayCommandType::SummonArmy ? "SummonArmy" : "Unknown") +
+            " | pending_gameplay=" +
+            std::to_string(gameplayCommandQueue_.size()));
 }
 
 void TerminalBackend::QueuePendingCommand(const PendingCommand& command)
@@ -464,6 +511,13 @@ void TerminalBackend::QueuePendingCommand(const PendingCommand& command)
 
 void TerminalBackend::ProcessGameplayCommand(const GameplayCommand& command)
 {
+    TraceDebug(
+        armyEnvironment_,
+        std::string("[TRACE] TerminalBackend::ProcessGameplayCommand entree | type=") +
+            (command.type == GameplayCommandType::SummonArmy ? "SummonArmy" : "Unknown") +
+            " | " +
+            BuildArmySessionDebugLine(armySession_));
+
     switch (command.type)
     {
     case GameplayCommandType::SummonArmy:
@@ -474,6 +528,10 @@ void TerminalBackend::ProcessGameplayCommand(const GameplayCommand& command)
             armySession_.pendingRequestCount = static_cast<int>(armySession_.pendingRequests.size());
             armySession_.currentWaveTarget = std::max(1, std::min(armySession_.requestedCount, 1));
             AppendOutputLine("[INFO] Spawn en cours : 0 / 30 unites creees.");
+            TraceDebug(
+                armyEnvironment_,
+                std::string("[TRACE] TerminalBackend::ProcessGameplayCommand /army -> Spawning | ") +
+                    BuildArmySessionDebugLine(armySession_));
         }
         break;
     default:

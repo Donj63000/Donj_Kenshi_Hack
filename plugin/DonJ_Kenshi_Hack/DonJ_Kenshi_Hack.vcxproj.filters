@@ -35,6 +35,9 @@
     <ClInclude Include="ArmySession.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ArmyDiagnostics.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ArmyCommandSpec.h">
       <Filter>Header Files</Filter>
     </ClInclude>
