@@ -1,31 +1,59 @@
 # DonJ Kenshi Hack
 
-Mod **Kenshi Steam** en cours de developpement qui ajoute une fenetre native in-game nommee **`DonJ Kenshi Hack`** avec un terminal de commandes.
+![Statut](https://img.shields.io/badge/statut-WIP%20%2F%20en%20chantier-orange)
+![Kenshi](https://img.shields.io/badge/jeu-Kenshi-7a4b2b)
+![Plugin](https://img.shields.io/badge/plugin-C%2B%2B-00599C)
+![Runtime](https://img.shields.io/badge/runtime-RE__Kenshi-4b5563)
 
-## Important
+Mod **Kenshi Steam** en cours de developpement qui ajoute une fenetre native in-game nommee **`DonJ Kenshi Hack`** avec un terminal de commandes extensible en **C++**.
 
-**Etat public actuel : ce projet est encore en construction et comporte encore des bugs.**
+> [!WARNING]
+> **Projet en chantier, actuellement non fonctionnel sur son objectif final.**
+>
+> Le pipeline complet de la commande **`/army`** est encore **bugue / en cours de debug** et peut encore provoquer des comportements incorrects ou des crashes.
+>
+> **Ce qui marche deja pour de vrai :**
+> - le plugin C++ est charge par **RE_Kenshi**
+> - la fenetre **`DonJ Kenshi Hack`** apparait bien en jeu
+> - le **terminal in-game fonctionne deja**
+> - on peut **creer ses propres commandes en C++** via le registre de commandes
+> - les commandes **`/help`** et **`/status`** sont deja operationnelles
 
-Il peut etre montre, teste et inspecte, mais il ne faut **pas** encore le considerer comme un mod stable ou finalise.
+## Vue d'ensemble
 
-Point sensible actuel :
-
-- la commande **`/army`** et son pipeline de spawn runtime sont encore en phase de debug/stabilisation
-- des crashes en jeu peuvent encore se produire pendant les tests
-- le depot est publie aussi pour faciliter la relecture et l'aide au debug
-
-Le projet vise un MVP tres precis :
+Le projet vise un MVP tres clair :
 
 - ajouter une fenetre UI native dans Kenshi
-- permettre de taper des commandes slash
+- fournir un terminal de commandes slash in-game
+- permettre d'etendre facilement le mod avec de nouvelles commandes C++
 - implementer la commande **`/army`**
 - invoquer **30 unites alliees**
 - leur donner un comportement **follow + protect**
 - les retirer automatiquement apres **180 secondes reelles**
 
+## Captures
+
+### Mod de donnees FCS
+
+![Mod de donnees FCS](docs/images/fcs-data-mod.png)
+
+*Les templates `DonJ_ArmyOfDead_Warrior_*` existent bien dans le mod FCS.*
+
+### Fenetre native dans Kenshi
+
+![Fenetre terminal au menu principal](docs/images/terminal-main-menu.png)
+
+*La fenetre `DonJ Kenshi Hack` est creee via MyGUI / RE_Kenshi directement dans Kenshi.*
+
+### Terminal actif en jeu
+
+![Terminal actif en jeu](docs/images/terminal-in-game.png)
+
+*Le terminal fonctionne deja en partie chargee avec les commandes `/help` et `/status`.*
+
 ## Etat actuel du projet
 
-Le projet a deja beaucoup avance. Aujourd'hui, ce qui est en place :
+### Ce qui est deja en place
 
 - mod de donnees FCS `DonJ_Kenshi_Hack.mod`
 - templates FCS :
@@ -45,32 +73,19 @@ Le projet a deja beaucoup avance. Aujourd'hui, ce qui est en place :
   - suivi du leader
   - ordres d'escorte
   - dissolution defensive
-- documentation pas a pas des etapes deja faites dans `docs/`
+- journal technique pas a pas dans `docs/`
 
-## Honnetete technique
+### Ce qui reste instable
 
-Le projet n'est **pas encore considere comme final stable**.
+- la materialisation runtime finale des unites via la **factory Kenshi**
+- le replay / hook de spawn natif selon le contexte de jeu
+- la stabilisation complete de **`/army`**
 
-Ce qui est deja valide :
+En bref :
 
-- le chargement du plugin
-- la fenetre UI
-- la saisie terminal
-- `/help`
-- `/status`
-- l'architecture de `/army`
-- le timer 180 secondes
-- le cleanup de session
-
-Le point encore sensible :
-
-- la materialisation runtime finale des 30 unites via la **factory Kenshi / replay hook**
-
-Autrement dit :
-
-- l'architecture serieuse est en place
-- la logique de session et de post-traitement est codee
-- mais le spawn runtime final est encore en phase de stabilisation/test en jeu
+- **le terminal est deja reellement exploitable**
+- **l'architecture du mod est serieuse et deja en place**
+- **le coeur encore fragile aujourd'hui est le spawn runtime final**
 
 ## Architecture retenue
 
@@ -79,10 +94,10 @@ Le projet suit volontairement une architecture hybride :
 - **FCS** : donnees du mod
 - **plugin natif C++** : runtime in-game
 - **RE_Kenshi / KenshiLib** : chargement et hooks
-- **MyGUI** : fenetre et terminal
+- **MyGUI** : fenetre, historique et saisie terminal
 - **C# / OpenConstructionSet** : outillage optionnel uniquement
 
-Ce n'est **pas** un mod FCS seul.
+Ce n'est **pas** un simple mod FCS.
 
 ## Arborescence utile
 
@@ -94,14 +109,16 @@ Les dossiers importants du depot :
   - package du mod pret a copier dans Kenshi
 - `docs/`
   - journal technique des etapes du projet
+- `docs/images/`
+  - captures utiles pour la page GitHub
 - `tests/`
   - tests natifs C++
 
-Note utile :
+Notes utiles :
 
 - dans le workspace de developpement d'origine, une copie de travail du plugin a aussi existe sous `KenshiLib_Examples/DonJ_Kenshi_Hack/`
-- pour GitHub, la version source autonome a publier est celle de `plugin/DonJ_Kenshi_Hack/`
-- l'outillage local d'automatisation utilise pendant le developpement n'est pas publie dans ce depot GitHub
+- pour GitHub, la version source de reference a publier est celle de `plugin/DonJ_Kenshi_Hack/`
+- l'outillage local prive utilise pendant le developpement n'est **pas** publie dans ce depot GitHub
 
 ## Installation du mod
 
@@ -114,28 +131,18 @@ Note utile :
 
 ### Installation rapide
 
-1. Copier le dossier :
-   - `package/DonJ_Kenshi_Hack/`
-
-   dans :
-
-   - `Kenshi/mods/DonJ_Kenshi_Hack/`
-
-2. Verifier que le dossier final contient bien :
+1. Copier le dossier `package/DonJ_Kenshi_Hack/`
+2. Le placer dans `Kenshi/mods/DonJ_Kenshi_Hack/`
+3. Verifier que le dossier final contient bien :
    - `DonJ_Kenshi_Hack.mod`
    - `RE_Kenshi.json`
    - `DonJ_Kenshi_Hack.dll`
+4. Lancer Kenshi
+5. Ouvrir l'onglet **Mods**
+6. Activer `DonJ_Kenshi_Hack`
+7. Arriver au menu principal puis lancer une partie
 
-3. Lancer Kenshi.
-
-4. Ouvrir l'onglet **Mods** et activer :
-   - `DonJ_Kenshi_Hack`
-
-5. Arriver au menu principal puis lancer une partie.
-
-### Installation manuelle precise
-
-Le dossier final dans Kenshi doit ressembler a ceci :
+### Structure attendue dans Kenshi
 
 ```text
 Kenshi/
@@ -158,7 +165,8 @@ Commandes disponibles actuellement :
 
 - `/help`
 - `/status`
-- `/army`
+- `/army`  
+  Attention : **encore en cours de debug**
 
 ## Comment modifier le mod
 
@@ -192,23 +200,31 @@ Le coeur du plugin est dans :
 - `plugin/DonJ_Kenshi_Hack/ArmyRuntimeManager.*`
 - `plugin/DonJ_Kenshi_Hack/ArmyCommandSpec.h`
 - `plugin/DonJ_Kenshi_Hack/ArmySession.h`
+- `plugin/DonJ_Kenshi_Hack/CommandRegistry.*`
+
+Le terminal est deja concu pour qu'on puisse ajouter facilement de nouvelles commandes C++, par exemple :
+
+- `/heal`
+- `/money`
+- `/teleport`
+- `/godmode`
 
 ## Comment recompiler le mod
 
 ### Prerequis de build
 
-- Visual Studio 2022 avec charge de travail **Desktop development with C++**
+- Visual Studio 2022 avec la charge de travail **Desktop development with C++**
 - dependances KenshiLib
 - RE_Kenshi / KenshiLib compatibles avec Kenshi
 
-Le projet s'appuie sur des variables d'environnement :
+Le projet s'appuie sur les variables d'environnement suivantes :
 
 - `KENSHILIB_DIR`
 - `KENSHILIB_DEPS_DIR`
 - `BOOST_INCLUDE_PATH`
 - `BOOST_ROOT`
 
-Sur cette machine, elles pointaient vers :
+Sur la machine de developpement initiale, elles pointaient vers :
 
 - `C:\Users\nodig\kenshi_donj_hack\KenshiLib_Examples_deps\KenshiLib`
 - `C:\Users\nodig\kenshi_donj_hack\KenshiLib_Examples_deps`
@@ -217,7 +233,7 @@ Sur cette machine, elles pointaient vers :
 
 ### Build du plugin
 
-Le projet a ete compile en :
+Le projet est compile en :
 
 - `Release`
 - `x64`
@@ -236,10 +252,8 @@ Fichier cible genere :
 
 Apres compilation :
 
-1. copier la DLL generee dans :
-   - `package/DonJ_Kenshi_Hack/DonJ_Kenshi_Hack.dll`
-2. recopier ensuite le package dans :
-   - `Kenshi/mods/DonJ_Kenshi_Hack/`
+1. copier la DLL generee dans `package/DonJ_Kenshi_Hack/DonJ_Kenshi_Hack.dll`
+2. recopier ensuite le package dans `Kenshi/mods/DonJ_Kenshi_Hack/`
 
 ## Lancer les tests
 
@@ -251,7 +265,7 @@ cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\V
 
 ## Protocole de test recommande
 
-Ordre de validation recommande :
+Ordre de validation conseille :
 
 1. verifier que le plugin charge
 2. verifier que la fenetre s'affiche
@@ -264,6 +278,18 @@ Ordre de validation recommande :
 9. verifier qu'une nouvelle session peut repartir proprement
 
 Pendant les tests de spawn, il est recommande de se placer **pres d'une zone peuplee**.
+
+## Aider au debug
+
+Si tu veux aider a trouver les bugs :
+
+- regarde le pipeline `/army`
+- teste en partie chargee, pas seulement au menu
+- surveille les crashes, les non-spawns et les blocages
+- lis les traces dans :
+  - `RE_Kenshi_log.txt`
+  - `save.log`
+  - `kenshi_info.log`
 
 ## Documentation detaillee
 
@@ -283,15 +309,13 @@ Les etapes deja traitees sont documentees dans :
 - `docs/step-12-allies-follow-protect.md`
 - `docs/step-13-timer-cleanup.md`
 
-## Notes importantes
+## Statut public du depot
 
-- le terminal runtime **ne vient pas du FCS**
-- le coeur in-game passe par **RE_Kenshi + KenshiLib + MyGUI**
-- la commande `/army` reste le coeur du MVP
-- le projet avance avec une logique de validation progressive pour eviter les crashes et les regressions
+Ce depot est publie pour :
 
-## Auteur / depot cible
+- montrer l'etat reel du chantier
+- partager une base de travail propre
+- permettre a d'autres personnes de relire le code
+- faciliter le debug des points encore sensibles
 
-Depot GitHub cible :
-
-- [Donj63000/Donj_Kenshi_Hack](https://github.com/Donj63000/Donj_Kenshi_Hack)
+Le projet avance, mais il faut le lire comme un **WIP technique serieux**, pas comme une release finale.
