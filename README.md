@@ -19,7 +19,7 @@ Mod **Kenshi Steam** en cours de developpement qui ajoute une fenetre native in-
 > - on peut **creer ses propres commandes en C++** via le registre de commandes
 > - les commandes **`/help`** et **`/status`** sont deja operationnelles
 
-![Terminal in-game](assets/terminal-in-game.png)
+![Terminal in-game](readmepost.png)
 
 *Capture in-game du terminal `DonJ Kenshi Hack` en fonctionnement.*
 
