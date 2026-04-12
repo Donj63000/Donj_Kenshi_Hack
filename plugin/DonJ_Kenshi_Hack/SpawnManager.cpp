@@ -54,7 +54,6 @@ bool SpawnManager::IsConfigured() const
         static_cast<bool>(environment_.isGameLoaded) &&
         static_cast<bool>(environment_.isFactoryAvailable) &&
         static_cast<bool>(environment_.resolveTemplate) &&
-        static_cast<bool>(environment_.resolvePlayerFaction) &&
         static_cast<bool>(environment_.resolveSpawnOrigin) &&
         static_cast<bool>(environment_.logInfo) &&
         static_cast<bool>(environment_.logError);
@@ -132,6 +131,18 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
         TraceDebug(environment_, traceBuffer);
     }
 
+    if (session.state == ArmyState::Idle || session.state == ArmyState::Dismissing)
+    {
+        if (!spawnQueue_.empty())
+        {
+            TraceDebug(environment_, "[TRACE] SpawnManager::Tick : purge defensive de la queue interne.");
+            Reset();
+        }
+
+        SyncPendingCount(session);
+        return 0;
+    }
+
     if (session.state != ArmyState::Spawning)
     {
         SyncPendingCount(session);
@@ -158,6 +169,7 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
         {
             session.state = ArmyState::Active;
             session.active = true;
+            session.waitingForReplayOpportunity = false;
             session.remainingSeconds = session.durationSeconds;
 
             char buffer[192] = {};
@@ -199,6 +211,19 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
 
     session.waitingForReplayOpportunity = false;
     session.currentWaveTarget = DetermineWaveTarget(config_, session.requestedCount, session.spawnedCount);
+
+    if (session.totalSpawnAttempts >= config_.maxTotalAttempts)
+    {
+        environment_.logError("[ERREUR] /army abandonnee : budget maximal de tentatives atteint.");
+        spawnQueue_.clear();
+        session.pendingRequests.clear();
+        session.pendingRequestCount = 0;
+        session.waitingForReplayOpportunity = false;
+        session.active = false;
+        session.remainingSeconds = 0.0f;
+        session.state = ArmyState::Dismissing;
+        return 0;
+    }
 
     int remainingWaveBudget = std::max(0, session.currentWaveTarget - session.spawnedCount);
     if (remainingWaveBudget <= 0)
@@ -248,14 +273,15 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
             continue;
         }
 
-        Faction* playerFaction = environment_.resolvePlayerFaction();
+        Faction* playerFaction = nullptr;
+        if (environment_.resolvePlayerFaction)
+        {
+            playerFaction = environment_.resolvePlayerFaction();
+        }
+
         if (playerFaction == nullptr)
         {
-            ++session.deferredSpawnAttempts;
-            spawnQueue_.push_front(request);
-            TraceDebug(environment_, "[TRACE] SpawnManager::Tick defer : faction joueur nulle.");
-            environment_.logInfo("[INFO] Spawn differe : faction joueur indisponible.");
-            break;
+            TraceDebug(environment_, "[TRACE] SpawnManager::Tick : faction joueur nulle, bootstrap leader autorise apres le spawn.");
         }
 
         SpawnPosition spawnOrigin;
@@ -382,6 +408,7 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
     {
         session.state = ArmyState::Active;
         session.active = true;
+        session.waitingForReplayOpportunity = false;
         session.remainingSeconds = session.durationSeconds;
 
         char buffer[192] = {};

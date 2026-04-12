@@ -23,6 +23,7 @@
 #include <Windows.h>
 
 #include <kenshi/Character.h>
+#include <kenshi/Damages.h>
 #include <kenshi/GameData.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/GameWorld.h>
@@ -45,6 +46,8 @@
 
 namespace
 {
+    constexpr const char* kArmyBuildStamp = __DATE__ " " __TIME__;
+
     TerminalBackend g_terminal;
     SpawnManager g_spawnManager;
     ArmyRuntimeManager g_armyRuntime;
@@ -75,6 +78,18 @@ namespace
     bool g_armyReplayOpportunityActive = false;
     int g_armyReplayDepth = 0;
 
+    struct ObservedNaturalSpawnContext
+    {
+        RootObjectFactory* factory = nullptr;
+        Faction* faction = nullptr;
+        RootObjectContainer* owner = nullptr;
+        Building* home = nullptr;
+        float age = 1.0f;
+        bool valid = false;
+    };
+
+    ObservedNaturalSpawnContext g_observedNaturalSpawnContext;
+
     bool IsGameWorldReady();
     bool IsArmyGameLoaded();
     bool IsArmyReplayHookInstalled();
@@ -86,6 +101,9 @@ namespace
     Ogre::Vector3 ComputeArmyFactorySpawnPosition(const SpawnPosition& spawnOrigin, int requestIndex);
     Character* ResolveArmyCharacterFromCreatedRoot(RootObject* createdRoot);
     void WriteCrashSafeArmyTrace(const std::string& message);
+    std::string GetArmyTraceFilePath();
+    void ResetObservedNaturalSpawnContext();
+    bool TryDismissArmyCharacterNoCrash(Character* character, unsigned int& outExceptionCode);
     bool TryInvokeArmyCreateRandomCharacterNoCrash(
         RootObjectFactory* factory,
         Faction* faction,
@@ -185,6 +203,78 @@ namespace
         WriteCrashSafeArmyTrace(buffer);
         DebugLog(buffer);
     }
+
+    std::string BuildArmyBuildMarker()
+    {
+        char buffer[256] = {};
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "DonJ Kenshi Hack : startPlugin | build=%s | msvc=%u",
+            kArmyBuildStamp,
+            static_cast<unsigned int>(_MSC_FULL_VER));
+        return buffer;
+    }
+
+    std::string GetArmyTraceFilePath()
+    {
+        char modulePath[MAX_PATH] = {};
+        const DWORD pathLength = GetModuleFileNameA(nullptr, modulePath, MAX_PATH);
+        if (pathLength == 0 || pathLength >= MAX_PATH)
+        {
+            return "DonJ_Kenshi_Hack_trace.log";
+        }
+
+        std::string fullPath(modulePath, pathLength);
+        const std::string::size_type separatorIndex = fullPath.find_last_of("\\/");
+        if (separatorIndex == std::string::npos)
+        {
+            return "DonJ_Kenshi_Hack_trace.log";
+        }
+
+        return fullPath.substr(0, separatorIndex) + "\\DonJ_Kenshi_Hack_trace.log";
+    }
+
+    void ResetObservedNaturalSpawnContext()
+    {
+        g_observedNaturalSpawnContext = ObservedNaturalSpawnContext();
+    }
+
+    void DismissArmyCharacter(Character* character)
+    {
+        if (character == nullptr || character->isDead())
+        {
+            return;
+        }
+
+        Damages lethalDamage(500, 500, 500, 500, 0);
+        for (std::size_t anatomyIndex = 0; anatomyIndex < character->medical.anatomy.size(); ++anatomyIndex)
+        {
+            // La je borne explicitement l'index sur le type attendu par le conteneur Kenshi.
+            const std::uint32_t safeAnatomyIndex = static_cast<std::uint32_t>(anatomyIndex);
+            if (character->medical.anatomy[safeAnatomyIndex] != nullptr)
+            {
+                character->medical.anatomy[safeAnatomyIndex]->applyDamage(lethalDamage);
+            }
+        }
+    }
+
+    bool TryDismissArmyCharacterNoCrash(Character* character, unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            DismissArmyCharacter(character);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
 
     bool ShouldTraceArmyTick(const ArmySession& session)
     {
@@ -423,9 +513,9 @@ namespace
             return;
         }
 
-        const char* tracePath = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\DonJ_Kenshi_Hack_trace.log";
+        const std::string tracePath = GetArmyTraceFilePath();
         HANDLE fileHandle = CreateFileA(
-            tracePath,
+            tracePath.c_str(),
             FILE_APPEND_DATA,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
@@ -624,12 +714,7 @@ namespace
             return false;
         }
 
-        if (RootObjectFactory_createRandomCharacter_orig == nullptr)
-        {
-            return false;
-        }
-
-        return ResolveArmyPlayerFaction() != nullptr && ResolveArmySpawnOwnerContainer() != nullptr;
+        return RootObjectFactory_createRandomCharacter_orig != nullptr;
     }
 
     bool IsArmyReplayHookInstalled()
@@ -643,7 +728,10 @@ namespace
     {
         // La je n'autorise le spawn que pendant une vraie creation native observee.
         // Ca evite l'appel direct a la factory depuis le game tick, qui a fait planter le jeu.
-        return g_armyReplayOpportunityActive && g_currentArmyReplayFactory != nullptr;
+        return
+            g_armyReplayOpportunityActive &&
+            g_observedNaturalSpawnContext.valid &&
+            g_observedNaturalSpawnContext.factory != nullptr;
     }
 
     bool TryResolveArmySpawnOrigin(SpawnPosition& outPosition)
@@ -856,23 +944,25 @@ namespace
             return result;
         }
 
-        RootObjectContainer* ownerContainer = ResolveArmySpawnOwnerContainer();
-        if (ownerContainer == nullptr || playerFaction == nullptr || g_currentArmyReplayFactory == nullptr)
+        (void)playerFaction;
+
+        const ObservedNaturalSpawnContext replayContext = g_observedNaturalSpawnContext;
+        if (!replayContext.valid || replayContext.factory == nullptr)
         {
             result.outcome = SpawnAttemptOutcome::DeferredFactoryUnavailable;
             result.shouldRequeue = true;
-            result.detail = "[INFO] Spawn differe : contexte factory joueur incomplet.";
+            result.detail = "[INFO] Spawn differe : contexte factory naturel incomplet.";
             return result;
         }
 
         const Ogre::Vector3 factorySpawnPosition = ComputeArmyFactorySpawnPosition(spawnOrigin, request.index);
         DebugTraceFormat(
-            "[TRACE] TrySpawnArmyUnitThroughFactory tentative | req=%s | template=%p | faction=%p | owner=%p | factory=%p | pos=(%.2f, %.2f, %.2f)",
+            "[TRACE] TrySpawnArmyUnitThroughFactory tentative | req=%s | template=%p | faction_nat=%p | owner_nat=%p | factory=%p | pos=(%.2f, %.2f, %.2f)",
             request.templateName.c_str(),
             static_cast<void*>(templateData),
-            static_cast<void*>(playerFaction),
-            static_cast<void*>(ownerContainer),
-            static_cast<void*>(g_currentArmyReplayFactory),
+            static_cast<void*>(replayContext.faction),
+            static_cast<void*>(replayContext.owner),
+            static_cast<void*>(replayContext.factory),
             static_cast<double>(factorySpawnPosition.x),
             static_cast<double>(factorySpawnPosition.y),
             static_cast<double>(factorySpawnPosition.z));
@@ -881,13 +971,13 @@ namespace
         RootObject* createdRoot = nullptr;
         unsigned int factoryExceptionCode = 0;
         const bool factoryCallSucceeded = TryInvokeArmyCreateRandomCharacterNoCrash(
-            g_currentArmyReplayFactory,
-            playerFaction,
+            replayContext.factory,
+            replayContext.faction,
             factorySpawnPosition,
-            ownerContainer,
+            replayContext.owner,
             templateData,
-            nullptr,
-            1.0f,
+            replayContext.home,
+            replayContext.age > 0.0f ? replayContext.age : 1.0f,
             createdRoot,
             factoryExceptionCode);
         --g_armyReplayDepth;
@@ -964,9 +1054,16 @@ namespace
         Building* home,
         float age)
     {
-        if (thisptr != nullptr && g_lastObservedArmyFactory != thisptr)
+        if (g_armyReplayDepth == 0)
         {
             g_lastObservedArmyFactory = thisptr;
+            g_observedNaturalSpawnContext.factory = thisptr;
+            g_observedNaturalSpawnContext.faction = faction;
+            g_observedNaturalSpawnContext.owner = owner;
+            g_observedNaturalSpawnContext.home = home;
+            g_observedNaturalSpawnContext.age = age;
+            g_observedNaturalSpawnContext.valid = (thisptr != nullptr);
+
             DebugTraceFormat(
                 "[TRACE] RootObjectFactory::createRandomCharacter observe | factory=%p | faction=%p | owner=%p | template=%p | pos=(%.2f, %.2f, %.2f) | age=%.2f",
                 static_cast<void*>(thisptr),
@@ -995,7 +1092,7 @@ namespace
 
         if (canReplayArmySpawn)
         {
-            g_currentArmyReplayFactory = thisptr;
+            g_currentArmyReplayFactory = g_observedNaturalSpawnContext.factory;
             g_armyReplayOpportunityActive = true;
 
             ArmySession& session = g_terminal.GetArmySession();
@@ -1040,6 +1137,11 @@ namespace
             TraceArmySessionPoint("apres ArmyRuntimeManager.Tick", session);
         }
 
+        if (session.state == ArmyState::Idle)
+        {
+            g_spawnManager.Reset();
+        }
+
         if (spawnedThisTick > 0)
         {
             char logMessage[160] = {};
@@ -1076,10 +1178,12 @@ namespace
         g_lastKnownGameWorldReady = gameWorldReady;
         if (gameWorldReady)
         {
+            g_spawnManager.Reset();
             g_lastObservedArmyFactory = nullptr;
             g_currentArmyReplayFactory = nullptr;
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
+            ResetObservedNaturalSpawnContext();
             ResetKeyboardEdgeTracking("entree en jeu");
         }
         else
@@ -1092,12 +1196,14 @@ namespace
                 g_terminal.MarkUiDirty();
             }
 
+            g_spawnManager.Reset();
             ResetKeyboardEdgeTracking("retour menu");
             g_armyHandleLookup.clear();
             g_lastObservedArmyFactory = nullptr;
             g_currentArmyReplayFactory = nullptr;
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
+            ResetObservedNaturalSpawnContext();
         }
     }
 
@@ -1106,7 +1212,7 @@ namespace
         if (g_terminal.GetPendingCommandCount() > 0)
         {
             DebugTraceFormat(
-                "[TRACE] ProcessDeferredTerminalCommands avant execution | source=%s | pending_ui=%zu | pending_gameplay=%zu",
+                "[TRACE] ProcessDeferredTerminalCommands | source=%s | pending_ui=%zu | pending_gameplay=%zu",
                 sourceName,
                 g_terminal.GetPendingCommandCount(),
                 g_terminal.GetPendingGameplayCommandCount());
@@ -1296,6 +1402,12 @@ namespace
 
         if (enterPressed)
         {
+            DebugTraceFormat(
+                "[TRACE] input_enter_pressed | input_active=%s | pending_ui=%zu | pending_gameplay=%zu",
+                g_terminal.IsInputActive() ? "yes" : "no",
+                g_terminal.GetPendingCommandCount(),
+                g_terminal.GetPendingGameplayCommandCount());
+
             if (!g_terminal.IsInputActive())
             {
                 g_terminal.ActivateInput();
@@ -1394,8 +1506,10 @@ namespace
 
 __declspec(dllexport) void startPlugin()
 {
-    DeleteFileA("C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi\\DonJ_Kenshi_Hack_trace.log");
-    WriteCrashSafeArmyTrace("DonJ Kenshi Hack : startPlugin");
+    DeleteFileA(GetArmyTraceFilePath().c_str());
+    const std::string buildMarker = BuildArmyBuildMarker();
+    WriteCrashSafeArmyTrace(buildMarker);
+    DebugLog(buildMarker.c_str());
 
     g_terminal.SetArmyCommandEnvironment({
         []() { return IsArmyGameLoaded(); },
@@ -1540,6 +1654,17 @@ __declspec(dllexport) void startPlugin()
         []() -> ArmyHandleId
         {
             return ResolveArmyLeaderHandleId();
+        },
+        [](Character* character)
+        {
+            unsigned int dismissExceptionCode = 0;
+            if (!TryDismissArmyCharacterNoCrash(character, dismissExceptionCode))
+            {
+                DebugTraceFormat(
+                    "[TRACE] DismissArmyCharacter exception structuree | code=0x%08X | character=%p",
+                    dismissExceptionCode,
+                    static_cast<void*>(character));
+            }
         }
     });
 

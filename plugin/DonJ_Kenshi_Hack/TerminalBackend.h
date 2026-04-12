@@ -11,7 +11,8 @@
 
 enum class GameplayCommandType
 {
-    SummonArmy
+    SummonArmy,
+    DismissArmy
 };
 
 struct PendingCommand
@@ -95,9 +96,11 @@ private:
     void ProcessGameplayCommand(const GameplayCommand& command);
     void TickArmySession(float deltaSeconds);
     ArmyPreflightCode EvaluateArmyPreflight() const;
+    void QueueArmyInvocation(const CommandContext& context, int requestedCount, float durationSeconds, bool testMode);
 
     static std::string Trim(const std::string& value);
     static std::vector<std::string> Tokenize(const std::string& line);
+    static bool TryParsePositiveInt(const std::string& value, int& outValue);
 
     std::deque<std::string> outputHistory_;
     std::vector<std::string> commandHistory_;

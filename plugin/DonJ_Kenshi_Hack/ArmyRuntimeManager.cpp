@@ -157,19 +157,17 @@ bool ArmyRuntimeManager::ConfigureSpawnedUnit(ArmySession& session, const SpawnR
 
     environment_.teleportCharacter(character, formationPosition);
 
-    if (environment_.setEscortRole)
-    {
-        environment_.setEscortRole(character);
-    }
-
-    environment_.setEscortOrder(character, ArmyEscortOrder::DefensiveCombat);
-    environment_.setEscortOrder(character, ArmyEscortOrder::ChaseTarget);
-    environment_.setFollowTarget(character, leader);
-
-    if (environment_.rethinkAi)
-    {
-        environment_.rethinkAi(character);
-    }
+    // IMPORTANT :
+    // On ne pousse pas encore les ordres d'escorte ici.
+    // La creation du personnage vient juste d'avoir lieu dans un contexte
+    // factory sensible. On limite donc le post-traitement immediat a :
+    // - faction
+    // - nom
+    // - position
+    //
+    // Les ordres "follow / protect / rethink AI" seront reappliques un peu plus
+    // tard depuis le game tick normal, ce qui reduit fortement le risque de crash.
+    session.escortRefreshAccumulator = kEscortRefreshIntervalSeconds;
 
     const ArmyHandleId characterHandleId = environment_.getCharacterHandleId(character);
     if (characterHandleId != 0)
@@ -181,7 +179,7 @@ bool ArmyRuntimeManager::ConfigureSpawnedUnit(ArmySession& session, const SpawnR
     std::snprintf(
         logMessage,
         sizeof(logMessage),
-        "[INFO] Escorte armee : unite %d liee au leader, faction appliquee et positionnee en formation.",
+        "[INFO] Escorte armee : unite %d creee, faction appliquee et positionnee. Escorte differee au tick suivant.",
         request.index + 1);
     environment_.logInfo(logMessage);
     return true;
@@ -432,6 +430,41 @@ void ArmyRuntimeManager::FinalizeDismiss(ArmySession& session)
     {
         return;
     }
+
+    std::vector<Character*> charactersToDismiss;
+    charactersToDismiss.reserve(session.activeUnitHandleIds.size() + session.activeUnits.size());
+
+    for (ArmyHandleId handleId : session.activeUnitHandleIds)
+    {
+        Character* character = environment_.resolveCharacterHandleId(handleId);
+        if (character != nullptr &&
+            std::find(charactersToDismiss.begin(), charactersToDismiss.end(), character) == charactersToDismiss.end())
+        {
+            charactersToDismiss.push_back(character);
+        }
+    }
+
+    for (Character* character : session.activeUnits)
+    {
+        if (character != nullptr &&
+            std::find(charactersToDismiss.begin(), charactersToDismiss.end(), character) == charactersToDismiss.end())
+        {
+            charactersToDismiss.push_back(character);
+        }
+    }
+
+    if (environment_.dismissCharacter)
+    {
+        for (Character* character : charactersToDismiss)
+        {
+            environment_.dismissCharacter(character);
+        }
+    }
+
+    TraceDebug(
+        environment_,
+        std::string("[TRACE] ArmyRuntimeManager::FinalizeDismiss : unites a dissoudre=") +
+            std::to_string(charactersToDismiss.size()));
 
     ResetArmySession(session);
     TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::FinalizeDismiss : session reinitialisee.");

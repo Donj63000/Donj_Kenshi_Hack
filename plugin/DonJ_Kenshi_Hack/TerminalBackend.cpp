@@ -8,13 +8,27 @@
 
 namespace
 {
+    const char* ToGameplayCommandLabel(GameplayCommandType type)
+    {
+        switch (type)
+        {
+        case GameplayCommandType::SummonArmy:
+            return "SummonArmy";
+        case GameplayCommandType::DismissArmy:
+            return "DismissArmy";
+        default:
+            return "Unknown";
+        }
+    }
+
     std::string BuildArmyStatusLine(const ArmySession& session)
     {
         const ArmyCommandSpec& spec = GetArmyCommandSpec();
+        const int targetUnitCount = session.requestedCount > 0 ? session.requestedCount : spec.unitCount;
         std::ostringstream builder;
         builder
             << "[INFO] /army : etat=" << ToStatusLabel(session.state)
-            << ", unites=" << session.spawnedCount << " / " << spec.unitCount
+            << ", unites=" << session.spawnedCount << " / " << targetUnitCount
             << ", spawned=" << session.spawnedCount
             << ", pending=" << session.pendingRequestCount
             << ", active_units=" << session.activeUnits.size()
@@ -166,6 +180,13 @@ bool TerminalBackend::SubmitCurrentInput()
 {
     const std::string line = Trim(inputBuffer_);
 
+    TraceDebug(
+        armyEnvironment_,
+        std::string("[TRACE] input_submit_called | line=") +
+            line +
+            " | pending_ui_before=" +
+            std::to_string(pendingCommands_.size()));
+
     commandHistoryBrowsing_ = false;
     commandHistoryCursor_ = commandHistory_.size();
     historyDraft_.clear();
@@ -174,6 +195,7 @@ bool TerminalBackend::SubmitCurrentInput()
 
     if (line.empty())
     {
+        TraceDebug(armyEnvironment_, "[TRACE] input_submit_ignored_empty");
         return false;
     }
 
@@ -184,9 +206,9 @@ bool TerminalBackend::SubmitCurrentInput()
     QueuePendingCommand({ line });
     TraceDebug(
         armyEnvironment_,
-        std::string("[TRACE] TerminalBackend::SubmitCurrentInput | line=") +
+        std::string("[TRACE] input_submit_success | line=") +
             line +
-            " | pending_ui=" +
+            " | pending_ui_after=" +
             std::to_string(pendingCommands_.size()));
     return true;
 }
@@ -259,6 +281,12 @@ size_t TerminalBackend::ProcessPendingCommands(size_t maxCommandsToProcess)
     {
         const PendingCommand command = pendingCommands_.front();
         pendingCommands_.pop_front();
+        TraceDebug(
+            armyEnvironment_,
+            std::string("[TRACE] ui_command_dequeued | line=") +
+                command.rawLine +
+                " | pending_ui_after_pop=" +
+                std::to_string(pendingCommands_.size()));
         ExecuteLine(command.rawLine);
         ++processedCount;
     }
@@ -341,6 +369,7 @@ void TerminalBackend::SetArmyCommandEnvironment(const ArmyCommandEnvironment& en
     armyEnvironment_ = environment;
 }
 
+
 void TerminalBackend::RegisterBuiltinCommands()
 {
     commandRegistry_.Register({
@@ -351,7 +380,9 @@ void TerminalBackend::RegisterBuiltinCommands()
             context.writeLine("Commandes disponibles :");
             context.writeLine(" - /help : affiche cette aide.");
             context.writeLine(" - /status : affiche l'etat du terminal et de /army.");
-            context.writeLine(" - /army : prepare l'invocation de l'armee des morts.");
+            context.writeLine(" - /army : prepare 30 allies temporaires pour 180 secondes.");
+            context.writeLine(" - /armytest <1..30> : lance une invocation de validation avec un plus petit volume.");
+            context.writeLine(" - /dismiss : force la dissolution de l'armee active.");
         } });
 
     commandRegistry_.Register({
@@ -372,54 +403,63 @@ void TerminalBackend::RegisterBuiltinCommands()
         "/army - prepare 30 allies temporaires pour 180 secondes.",
         [this](const CommandContext& context, const std::vector<std::string>&)
         {
-            const ArmyCommandSpec& spec = GetArmyCommandSpec();
-            ArmySession& session = context.getArmySession();
-
             const ArmyPreflightCode preflightCode = EvaluateArmyPreflight();
             if (preflightCode != ArmyPreflightCode::Ok)
             {
                 context.writeLine(ToPreflightMessage(preflightCode));
-                context.writeLine(BuildArmyStatusLine(session));
+                context.writeLine(BuildArmyStatusLine(context.getArmySession()));
                 return;
             }
 
-            ResetArmySession(session);
-            session.state = ArmyState::Preparing;
-            session.requestedCount = spec.unitCount;
-            session.durationSeconds = spec.durationSeconds;
-            session.remainingSeconds = spec.durationSeconds;
-            session.lockOneArmyAtATime = spec.singleArmyAtATime;
+            QueueArmyInvocation(context, GetArmyCommandSpec().unitCount, GetArmyCommandSpec().durationSeconds, false);
+        } });
+
+    commandRegistry_.Register({
+        "armytest",
+        "/armytest <1..30> - prepare une invocation de validation.",
+        [this](const CommandContext& context, const std::vector<std::string>& args)
+        {
+            const ArmyPreflightCode preflightCode = EvaluateArmyPreflight();
+            if (preflightCode != ArmyPreflightCode::Ok)
+            {
+                context.writeLine(ToPreflightMessage(preflightCode));
+                context.writeLine(BuildArmyStatusLine(context.getArmySession()));
+                return;
+            }
+
+            if (args.empty())
+            {
+                context.writeLine("[INFO] Usage : /armytest <1..30>.");
+                return;
+            }
+
+            int requestedCount = 0;
+            if (!TryParsePositiveInt(args.front(), requestedCount))
+            {
+                context.writeLine("[ERREUR] /armytest attend un entier compris entre 1 et 30.");
+                return;
+            }
+
+            requestedCount = std::max(1, std::min(30, requestedCount));
+            QueueArmyInvocation(context, requestedCount, GetArmyCommandSpec().durationSeconds, true);
+        } });
+
+    commandRegistry_.Register({
+        "dismiss",
+        "/dismiss - force la dissolution de l'armee active.",
+        [this](const CommandContext& context, const std::vector<std::string>&)
+        {
+            ArmySession& session = context.getArmySession();
+            if (session.state == ArmyState::Idle)
+            {
+                context.writeLine("[INFO] /dismiss : aucune invocation active.");
+                return;
+            }
 
             GameplayCommand gameplayCommand;
-            gameplayCommand.type = GameplayCommandType::SummonArmy;
-            gameplayCommand.requestedCount = session.requestedCount;
-            gameplayCommand.durationSeconds = session.durationSeconds;
-            gameplayCommand.templateNames.reserve(static_cast<size_t>(session.requestedCount));
-
-            for (int index = 0; index < session.requestedCount; ++index)
-            {
-                const std::string templateName = spec.templateNames[static_cast<size_t>(index) % spec.templateNames.size()];
-                session.pendingRequests.push_back({ templateName, index });
-                gameplayCommand.templateNames.push_back(templateName);
-            }
-            session.pendingRequestCount = static_cast<int>(session.pendingRequests.size());
-            session.currentWaveTarget = 1;
-
+            gameplayCommand.type = GameplayCommandType::DismissArmy;
             context.enqueueGameplayCommand(gameplayCommand);
-
-            std::ostringstream acceptedMessage;
-            acceptedMessage
-                << "[OK] " << spec.displayName
-                << " : preparation de " << spec.unitCount << " invocations.";
-            context.writeLine(acceptedMessage.str());
-            context.writeLine("[INFO] Plan de validation du spawn : 1 -> 3 -> 10 -> 30.");
-            context.writeLine("[INFO] Le spawn passera uniquement par une voie de factory Kenshi.");
-            context.writeLine("[INFO] Les messages de progression et de fin seront publies par le game tick.");
-            context.writeLine(BuildArmyStatusLine(session));
-            TraceDebug(
-                armyEnvironment_,
-                std::string("[TRACE] Commande /army preparee | ") +
-                    BuildArmySessionDebugLine(session));
+            context.writeLine("[OK] /dismiss : nettoyage force programme.");
         } });
 }
 
@@ -498,8 +538,8 @@ void TerminalBackend::QueueGameplayCommand(const GameplayCommand& command)
     gameplayCommandQueue_.push_back(command);
     TraceDebug(
         armyEnvironment_,
-        std::string("[TRACE] TerminalBackend::QueueGameplayCommand | type=") +
-            (command.type == GameplayCommandType::SummonArmy ? "SummonArmy" : "Unknown") +
+        std::string("[TRACE] gameplay_command_enqueued | type=") +
+            ToGameplayCommandLabel(command.type) +
             " | pending_gameplay=" +
             std::to_string(gameplayCommandQueue_.size()));
 }
@@ -509,12 +549,13 @@ void TerminalBackend::QueuePendingCommand(const PendingCommand& command)
     pendingCommands_.push_back(command);
 }
 
+
 void TerminalBackend::ProcessGameplayCommand(const GameplayCommand& command)
 {
     TraceDebug(
         armyEnvironment_,
-        std::string("[TRACE] TerminalBackend::ProcessGameplayCommand entree | type=") +
-            (command.type == GameplayCommandType::SummonArmy ? "SummonArmy" : "Unknown") +
+        std::string("[TRACE] gameplay_command_processing | type=") +
+            ToGameplayCommandLabel(command.type) +
             " | " +
             BuildArmySessionDebugLine(armySession_));
 
@@ -527,13 +568,31 @@ void TerminalBackend::ProcessGameplayCommand(const GameplayCommand& command)
             armySession_.state = ArmyState::Spawning;
             armySession_.pendingRequestCount = static_cast<int>(armySession_.pendingRequests.size());
             armySession_.currentWaveTarget = std::max(1, std::min(armySession_.requestedCount, 1));
-            AppendOutputLine("[INFO] Spawn en cours : 0 / 30 unites creees.");
+
+            std::ostringstream statusLine;
+            statusLine << "[INFO] Spawn en cours : 0 / " << armySession_.requestedCount << " unites creees.";
+            AppendOutputLine(statusLine.str());
+
             TraceDebug(
                 armyEnvironment_,
                 std::string("[TRACE] TerminalBackend::ProcessGameplayCommand /army -> Spawning | ") +
                     BuildArmySessionDebugLine(armySession_));
         }
         break;
+
+    case GameplayCommandType::DismissArmy:
+        if (armySession_.state != ArmyState::Idle)
+        {
+            armySession_.pendingRequests.clear();
+            armySession_.pendingRequestCount = 0;
+            armySession_.waitingForReplayOpportunity = false;
+            armySession_.state = ArmyState::Dismissing;
+            armySession_.active = false;
+            armySession_.remainingSeconds = 0.0f;
+            AppendOutputLine("[OK] Dissolution forcee : nettoyage demande au runtime.");
+        }
+        break;
+
     default:
         break;
     }
@@ -558,6 +617,55 @@ void TerminalBackend::TickArmySession(float deltaSeconds)
         armySession_.active = false;
         AppendOutputLine("[OK] Fin d'invocation : nettoyage effectue.");
     }
+}
+
+
+void TerminalBackend::QueueArmyInvocation(const CommandContext& context, int requestedCount, float durationSeconds, bool testMode)
+{
+    const ArmyCommandSpec& spec = GetArmyCommandSpec();
+    ArmySession& session = context.getArmySession();
+
+    ResetArmySession(session);
+    session.state = ArmyState::Preparing;
+    session.requestedCount = std::max(1, requestedCount);
+    session.durationSeconds = durationSeconds;
+    session.remainingSeconds = durationSeconds;
+    session.lockOneArmyAtATime = spec.singleArmyAtATime;
+
+    GameplayCommand gameplayCommand;
+    gameplayCommand.type = GameplayCommandType::SummonArmy;
+    gameplayCommand.requestedCount = session.requestedCount;
+    gameplayCommand.durationSeconds = session.durationSeconds;
+    gameplayCommand.templateNames.reserve(static_cast<size_t>(session.requestedCount));
+
+    for (int index = 0; index < session.requestedCount; ++index)
+    {
+        const std::string templateName = spec.templateNames[static_cast<size_t>(index) % spec.templateNames.size()];
+        session.pendingRequests.push_back({ templateName, index });
+        gameplayCommand.templateNames.push_back(templateName);
+    }
+
+    session.pendingRequestCount = static_cast<int>(session.pendingRequests.size());
+    session.currentWaveTarget = 1;
+
+    context.enqueueGameplayCommand(gameplayCommand);
+
+    std::ostringstream acceptedMessage;
+    acceptedMessage
+        << "[OK] " << spec.displayName
+        << (testMode ? " (mode test)" : "")
+        << " : preparation de " << session.requestedCount << " invocation(s).";
+    context.writeLine(acceptedMessage.str());
+    context.writeLine("[INFO] Plan de validation recommande : 1 -> 3 -> 10 -> 30.");
+    context.writeLine("[INFO] Le spawn passera uniquement par une voie de factory Kenshi.");
+    context.writeLine("[INFO] Utilise /dismiss pour nettoyer une session bloquee.");
+    context.writeLine("[INFO] Les messages de progression et de fin seront publies par le game tick.");
+    context.writeLine(BuildArmyStatusLine(session));
+
+    TraceDebug(
+        armyEnvironment_,
+        std::string("[TRACE] QueueArmyInvocation | ") +
+            BuildArmySessionDebugLine(session));
 }
 
 ArmyPreflightCode TerminalBackend::EvaluateArmyPreflight() const
@@ -619,4 +727,29 @@ std::vector<std::string> TerminalBackend::Tokenize(const std::string& line)
     }
 
     return tokens;
+}
+
+
+bool TerminalBackend::TryParsePositiveInt(const std::string& value, int& outValue)
+{
+    std::istringstream stream(value);
+    int parsedValue = 0;
+    char trailingCharacter = '\0';
+    if (!(stream >> parsedValue))
+    {
+        return false;
+    }
+
+    if (stream >> trailingCharacter)
+    {
+        return false;
+    }
+
+    if (parsedValue <= 0)
+    {
+        return false;
+    }
+
+    outValue = parsedValue;
+    return true;
 }

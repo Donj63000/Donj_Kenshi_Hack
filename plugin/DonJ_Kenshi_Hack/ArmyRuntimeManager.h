@@ -42,6 +42,7 @@ struct ArmyRuntimeEnvironment
     std::function<void(const std::string&)> logError = [](const std::string&) {};
     std::function<void(const std::string&)> traceDebug = [](const std::string&) {};
     std::function<ArmyHandleId()> resolveLeaderHandleId = []() { return static_cast<ArmyHandleId>(0); };
+    std::function<void(Character*)> dismissCharacter = [](Character*) {};
 };
 
 class ArmyRuntimeManager

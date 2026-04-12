@@ -40,7 +40,9 @@ struct SpawnAttemptResult
 
 struct SpawnManagerConfig
 {
-    int maxAttemptsPerTick = 10;
+    // Par defaut, on reste volontairement conservateur : une seule tentative par tick.
+    int maxAttemptsPerTick = 1;
+    int maxTotalAttempts = 200;
     float reminderIntervalSeconds = 5.0f;
     std::array<int, 4> validationWaveTargets = { 1, 3, 10, 30 };
 };

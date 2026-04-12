@@ -64,6 +64,7 @@ namespace
         assert(output.find("Commande inconnue") != std::string::npos);
     }
 
+
     void TestArmyCommandPreparesSessionAndQueue()
     {
         TerminalBackend backend;
@@ -84,6 +85,28 @@ namespace
         backend.TickGameplay(0.016f);
         assert(backend.GetArmySession().state == ArmyState::Spawning);
         assert(backend.GetArmySession().currentWaveTarget == 1);
+    }
+
+    void TestArmyTestCommandAcceptsReducedVolumes()
+    {
+        TerminalBackend backend;
+
+        backend.SetInputBuffer("/armytest 3");
+        const bool submitted = backend.SubmitCurrentInput();
+        backend.ProcessPendingCommands();
+
+        assert(submitted);
+        assert(backend.HasPendingGameplayCommands());
+        assert(backend.GetArmySession().state == ArmyState::Preparing);
+        assert(backend.GetArmySession().requestedCount == 3);
+        assert(backend.GetArmySession().pendingRequests.size() == 3);
+
+        backend.TickGameplay(0.016f);
+        assert(backend.GetArmySession().state == ArmyState::Spawning);
+        assert(backend.GetArmySession().currentWaveTarget == 1);
+
+        const std::string output = backend.BuildOutputText();
+        assert(output.find("mode test") != std::string::npos);
     }
 
     void TestArmyRefusesWhenGameIsNotLoaded()
@@ -143,6 +166,49 @@ namespace
         assert(outputAfterTick.find("[INFO] /army : etat=") != std::string::npos);
     }
 
+    void TestTerminalTraceMilestonesRemainVisible()
+    {
+        TerminalBackend backend;
+        std::vector<std::string> traces;
+
+        backend.SetArmyCommandEnvironment({
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            [&traces](const std::string& line)
+            {
+                traces.push_back(line);
+            }
+        });
+
+        backend.SetInputBuffer("/armytest 1");
+        const bool submitted = backend.SubmitCurrentInput();
+        assert(submitted);
+
+        backend.ProcessPendingCommands();
+        backend.TickGameplay(0.016f);
+
+        auto containsTrace = [&traces](const char* needle)
+        {
+            for (const std::string& line : traces)
+            {
+                if (line.find(needle) != std::string::npos)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
+        assert(containsTrace("input_submit_called"));
+        assert(containsTrace("input_submit_success"));
+        assert(containsTrace("ui_command_dequeued"));
+        assert(containsTrace("gameplay_command_enqueued"));
+        assert(containsTrace("gameplay_command_processing"));
+    }
+
     void TestSpawnManagerWaitsForReplayHook()
     {
         SpawnManager manager;
@@ -197,6 +263,7 @@ namespace
         assert(foundHint);
     }
 
+
     void TestSpawnManagerWaitsForObservedFactoryOpportunity()
     {
         SpawnManager manager;
@@ -248,6 +315,174 @@ namespace
             }
         }
         assert(foundHint);
+    }
+
+    void TestSpawnManagerAllowsLeaderBootstrapWhenPlayerFactionIsUnavailable()
+    {
+        SpawnManager manager;
+
+        manager.SetEnvironment({
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            [](const std::string&) -> void* { return reinterpret_cast<void*>(0x1010); },
+            []() -> Faction* { return static_cast<Faction*>(nullptr); },
+            [](SpawnPosition& position) -> bool
+            {
+                position = { 2.0f, 3.0f, 4.0f };
+                return true;
+            },
+            [](const SpawnRequest&, void*, Faction*, const SpawnPosition&) -> SpawnAttemptResult
+            {
+                SpawnAttemptResult result;
+                result.outcome = SpawnAttemptOutcome::Spawned;
+                result.character = reinterpret_cast<Character*>(0x3030);
+                return result;
+            },
+            {},
+            [](const std::string&) {},
+            [](const std::string&) {}
+        });
+
+        ArmySession session;
+        session.state = ArmyState::Spawning;
+        session.requestedCount = 1;
+        session.durationSeconds = 180.0f;
+        session.pendingRequests.push_back({ "DonJ_ArmyOfDead_Warrior_A", 0 });
+
+        manager.Tick(session, 0.016f);
+
+        assert(session.spawnedCount == 1);
+        assert(session.pendingRequestCount == 0);
+        assert(session.state == ArmyState::Active);
+        assert(session.active);
+    }
+
+    void TestSpawnManagerPurgesInternalQueueWhenSessionReturnsIdle()
+    {
+        SpawnManager manager;
+
+        manager.SetEnvironment({
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            []() { return false; },
+            [](const std::string&) -> void* { return reinterpret_cast<void*>(0x1010); },
+            []() -> Faction* { return reinterpret_cast<Faction*>(0x2020); },
+            [](SpawnPosition& position) -> bool
+            {
+                position = { 0.0f, 0.0f, 0.0f };
+                return true;
+            },
+            {},
+            {},
+            [](const std::string&) {},
+            [](const std::string&) {}
+        });
+
+        ArmySession session;
+        session.state = ArmyState::Spawning;
+        session.pendingRequests.push_back({ "DonJ_ArmyOfDead_Warrior_A", 0 });
+
+        manager.Tick(session, 0.016f);
+        assert(manager.HasPendingRequests());
+
+        session.state = ArmyState::Idle;
+        manager.Tick(session, 0.016f);
+
+        assert(!manager.HasPendingRequests());
+        assert(session.pendingRequestCount == 0);
+    }
+
+    void TestSpawnManagerPurgesInternalQueueWhenSessionStartsDismissing()
+    {
+        SpawnManager manager;
+
+        manager.SetEnvironment({
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            []() { return false; },
+            [](const std::string&) -> void* { return reinterpret_cast<void*>(0x1010); },
+            []() -> Faction* { return reinterpret_cast<Faction*>(0x2020); },
+            [](SpawnPosition& position) -> bool
+            {
+                position = { 0.0f, 0.0f, 0.0f };
+                return true;
+            },
+            {},
+            {},
+            [](const std::string&) {},
+            [](const std::string&) {}
+        });
+
+        ArmySession session;
+        session.state = ArmyState::Spawning;
+        session.pendingRequests.push_back({ "DonJ_ArmyOfDead_Warrior_A", 0 });
+
+        manager.Tick(session, 0.016f);
+        assert(manager.HasPendingRequests());
+
+        session.state = ArmyState::Dismissing;
+        manager.Tick(session, 0.016f);
+
+        assert(!manager.HasPendingRequests());
+        assert(session.pendingRequestCount == 0);
+    }
+
+    void TestSpawnManagerAbandonsSessionWhenAttemptBudgetIsExhausted()
+    {
+        SpawnManager manager;
+        SpawnManagerConfig config;
+        config.maxTotalAttempts = 3;
+        manager.SetConfig(config);
+
+        std::vector<std::string> errorLines;
+        manager.SetEnvironment({
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            []() { return false; },
+            [](const std::string&) -> void* { return reinterpret_cast<void*>(0x1010); },
+            []() -> Faction* { return reinterpret_cast<Faction*>(0x2020); },
+            [](SpawnPosition& position) -> bool
+            {
+                position = { 0.0f, 0.0f, 0.0f };
+                return true;
+            },
+            {},
+            {},
+            [](const std::string&) {},
+            [&errorLines](const std::string& line)
+            {
+                errorLines.push_back(line);
+            }
+        });
+
+        ArmySession session;
+        session.state = ArmyState::Spawning;
+        session.requestedCount = 10;
+        session.totalSpawnAttempts = 3;
+        session.pendingRequests.push_back({ "DonJ_ArmyOfDead_Warrior_A", 0 });
+
+        manager.Tick(session, 0.016f);
+
+        assert(session.state == ArmyState::Dismissing);
+        assert(!session.active);
+        assert(session.pendingRequestCount == 0);
+        assert(session.pendingRequests.empty());
+
+        bool foundBudgetError = false;
+        for (const std::string& line : errorLines)
+        {
+            if (line.find("budget maximal de tentatives") != std::string::npos)
+            {
+                foundBudgetError = true;
+                break;
+            }
+        }
+        assert(foundBudgetError);
     }
 
     void TestSpawnManagerAdvancesValidationWaves()
@@ -313,6 +548,7 @@ namespace
         assert(session.failedSpawnAttempts == 0);
     }
 
+
     void TestArmyRuntimeManagerBootstrapsFactionAndTracksEscort()
     {
         ArmyRuntimeManager manager;
@@ -369,11 +605,16 @@ namespace
             },
             [](Character*) { return false; },
             [](Character*) { return false; },
-            [leader](Character* character) -> SpawnPosition
+            [leader, minion, &teleportedPosition](Character* character) -> SpawnPosition
             {
                 if (character == leader)
                 {
                     return { 10.0f, 0.0f, 20.0f };
+                }
+
+                if (character == minion)
+                {
+                    return teleportedPosition;
                 }
 
                 return { 0.0f, 0.0f, 0.0f };
@@ -412,6 +653,8 @@ namespace
         });
 
         ArmySession session;
+        session.state = ArmyState::Spawning;
+        session.activeUnits.push_back(minion);
         SpawnRequest request;
         request.templateName = "DonJ_ArmyOfDead_Warrior_A";
         request.index = 0;
@@ -425,17 +668,23 @@ namespace
         assert(session.activeUnitHandleIds.front() == 22);
         assert(appliedFaction == leaderFaction);
         assert(appliedPlatoon == activePlatoon);
-        assert(followLeader == leader);
+        assert(followLeader == nullptr);
+        assert(orders.empty());
+        assert(roleAssignments == 0);
+        assert(rethinkCalls == 0);
         assert(!renamedCharacter.empty());
-        assert(!orders.empty());
-        assert(roleAssignments == 1);
-        assert(rethinkCalls == 1);
 
         const float dx = teleportedPosition.x - 10.0f;
         const float dz = teleportedPosition.z - 20.0f;
         const float distance = std::sqrt((dx * dx) + (dz * dz));
         assert(distance >= 1.9f);
         assert(distance <= 8.1f);
+
+        manager.Tick(session, 0.60f);
+        assert(followLeader == leader);
+        assert(orders.size() == 2);
+        assert(roleAssignments == 1);
+        assert(rethinkCalls == 1);
     }
 
     void TestArmyRuntimeManagerDismissesWhenLeaderContextChanges()
@@ -689,9 +938,13 @@ namespace
         assert(output.find("[OK] Fin d'invocation : nettoyage effectue.") != std::string::npos);
     }
 
+
     void TestArmyRuntimeFinalizeDismissResetsSessionState()
     {
         ArmyRuntimeManager manager;
+        int dismissCalls = 0;
+        Character* dismissedCharacter = reinterpret_cast<Character*>(0x4040);
+
         manager.SetEnvironment({
             []() { return true; },
             []() { return static_cast<Character*>(nullptr); },
@@ -701,7 +954,10 @@ namespace
             [](Character*) { return static_cast<Faction*>(nullptr); },
             [](Character*) -> ArmyHandleId { return 0; },
             [](Platoon*) -> ArmyHandleId { return 0; },
-            [](ArmyHandleId) { return static_cast<Character*>(nullptr); },
+            [dismissedCharacter](ArmyHandleId handleId)
+            {
+                return handleId == 303 ? dismissedCharacter : static_cast<Character*>(nullptr);
+            },
             [](Character*) { return false; },
             [](Character*) { return false; },
             [](Character*) { return SpawnPosition(); },
@@ -713,7 +969,13 @@ namespace
             {},
             {},
             [](const std::string&) {},
-            [](const std::string&) {}
+            [](const std::string&) {},
+            [](const std::string&) {},
+            []() -> ArmyHandleId { return 0; },
+            [&dismissCalls](Character*)
+            {
+                ++dismissCalls;
+            }
         });
 
         ArmySession session;
@@ -736,10 +998,11 @@ namespace
         session.leaderPlatoonHandleId = 202;
         session.pendingRequests.push_back({ "DonJ_ArmyOfDead_Warrior_A", 12 });
         session.activeUnitHandleIds.push_back(303);
-        session.activeUnits.push_back(reinterpret_cast<Character*>(0x4040));
+        session.activeUnits.push_back(dismissedCharacter);
 
         manager.Tick(session, 0.016f);
 
+        assert(dismissCalls == 1);
         assert(session.state == ArmyState::Idle);
         assert(session.requestedCount == 30);
         assert(session.spawnedCount == 0);
@@ -760,6 +1023,7 @@ namespace
         assert(session.activeUnitHandleIds.empty());
         assert(session.activeUnits.empty());
     }
+
 
     void TestArmyCanBeReusedAfterCleanup()
     {
@@ -787,7 +1051,10 @@ namespace
             {},
             {},
             [](const std::string&) {},
-            [](const std::string&) {}
+            [](const std::string&) {},
+            [](const std::string&) {},
+            []() -> ArmyHandleId { return 0; },
+            [](Character*) {}
         });
 
         ArmySession& session = backend.GetArmySession();
@@ -819,6 +1086,30 @@ namespace
         assert(session.state == ArmyState::Preparing);
         assert(session.pendingRequests.size() == 30);
         assert(session.pendingRequestCount == 30);
+    }
+
+    void TestDismissCommandQueuesCleanup()
+    {
+        TerminalBackend backend;
+        ArmySession& session = backend.GetArmySession();
+        session.state = ArmyState::Active;
+        session.active = true;
+        session.requestedCount = 3;
+        session.spawnedCount = 3;
+
+        backend.SetInputBuffer("/dismiss");
+        const bool submitted = backend.SubmitCurrentInput();
+        assert(submitted);
+        backend.ProcessPendingCommands();
+        assert(backend.HasPendingGameplayCommands());
+
+        backend.TickGameplay(0.016f);
+        assert(session.state == ArmyState::Dismissing);
+        assert(!session.active);
+        assert(session.pendingRequestCount == 0);
+
+        const std::string output = backend.BuildOutputText();
+        assert(output.find("Dissolution forcee") != std::string::npos);
     }
 
     void TestRuntimePointerIdentityUsesPointerValueSafely()
@@ -868,11 +1159,17 @@ int main()
     TestHelpCommandWritesHistory();
     TestUnknownCommandIsRejected();
     TestArmyCommandPreparesSessionAndQueue();
+    TestArmyTestCommandAcceptsReducedVolumes();
     TestArmyRefusesWhenGameIsNotLoaded();
     TestCommandHistoryNavigation();
     TestSubmitQueuesWithoutImmediateExecution();
+    TestTerminalTraceMilestonesRemainVisible();
     TestSpawnManagerWaitsForReplayHook();
     TestSpawnManagerWaitsForObservedFactoryOpportunity();
+    TestSpawnManagerAllowsLeaderBootstrapWhenPlayerFactionIsUnavailable();
+    TestSpawnManagerPurgesInternalQueueWhenSessionReturnsIdle();
+    TestSpawnManagerPurgesInternalQueueWhenSessionStartsDismissing();
+    TestSpawnManagerAbandonsSessionWhenAttemptBudgetIsExhausted();
     TestSpawnManagerAdvancesValidationWaves();
     TestArmyRuntimeManagerBootstrapsFactionAndTracksEscort();
     TestArmyRuntimeManagerDismissesWhenLeaderContextChanges();
@@ -882,6 +1179,7 @@ int main()
     TestArmyTimerTransitionsToDismissingOnGameplayTick();
     TestArmyRuntimeFinalizeDismissResetsSessionState();
     TestArmyCanBeReusedAfterCleanup();
+    TestDismissCommandQueuesCleanup();
     TestRuntimePointerIdentityUsesPointerValueSafely();
     TestArmyDiagnosticsBuildReadableSnapshots();
     return 0;
