@@ -1,0 +1,64 @@
+# Dependances lourdes et references locales
+KenshiLib_Examples_deps/
+refs/
+backups/
+AGENTS.md
+requirements.txt
+src/
+docs/desktop-control.md
+tests/test_desktop_control.py
+
+# Clone local des exemples KenshiLib non versionne dans ce depot
+KenshiLib_Examples/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Logs et artefacts locaux Kenshi
+*.log
+settings.cfg
+kenshi.cfg
+crashDump*.zip
+crashDump*.dmp
+Havok.log
+MyGUI.log
+FileIOLog.txt
+
+# Artefacts C++/Visual Studio
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.idb
+*.recipe
+*.tlog
+*.lastbuildstate
+*.vcxproj.FileListAbsolute.txt
+*.Build.CppClean.log
+*.suo
+*.user
+
+# Sorties de build
+Debug/
+x64/
+bin/
+obj/
+
+# Exclure les sorties imbriquees du projet Visual Studio
+KenshiLib_Examples/DonJ_Kenshi_Hack/DonJ_Kenshi_Hack/Debug/
+KenshiLib_Examples/DonJ_Kenshi_Hack/DonJ_Kenshi_Hack/x64/
+KenshiLib_Examples/DonJ_Kenshi_Hack/x64/
+
+# Executables de test locaux
+tests/*.exe
+
+# Fichiers temporaires a la racine
+*.tmp
+*.bak
