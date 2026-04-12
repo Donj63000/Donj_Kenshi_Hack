@@ -53,7 +53,6 @@ Le projet vise un MVP tres clair :
   - suivi du leader
   - ordres d'escorte
   - dissolution defensive
-- journal technique pas a pas dans `docs/`
 
 ### Ce qui reste instable
 
@@ -87,8 +86,6 @@ Les dossiers importants du depot :
   - code source du plugin
 - `package/DonJ_Kenshi_Hack/`
   - package du mod pret a copier dans Kenshi
-- `docs/`
-  - journal technique des etapes du projet
 - `tests/`
   - tests natifs C++
 
@@ -268,24 +265,6 @@ Si tu veux aider a trouver les bugs :
   - `RE_Kenshi_log.txt`
   - `save.log`
   - `kenshi_info.log`
-
-## Documentation detaillee
-
-Les etapes deja traitees sont documentees dans :
-
-- `docs/step-01-environment.md`
-- `docs/step-02-re-kenshi.md`
-- `docs/step-03-fcs-data-mod.md`
-- `docs/step-04-plugin-project.md`
-- `docs/step-05-package-mod.md`
-- `docs/step-06-minimal-plugin-load.md`
-- `docs/step-07-ui-window.md`
-- `docs/step-08-terminal-parser.md`
-- `docs/step-09-command-queue-game-tick.md`
-- `docs/step-10-army-spec.md`
-- `docs/step-11-safe-spawn-manager.md`
-- `docs/step-12-allies-follow-protect.md`
-- `docs/step-13-timer-cleanup.md`
 
 ## Statut public du depot
 

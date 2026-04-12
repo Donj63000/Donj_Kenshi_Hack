@@ -2,10 +2,10 @@
 KenshiLib_Examples_deps/
 refs/
 backups/
+docs/
 AGENTS.md
 requirements.txt
 src/
-docs/desktop-control.md
 tests/test_desktop_control.py
 
 # Clone local des exemples KenshiLib non versionne dans ce depot
