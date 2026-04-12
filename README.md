@@ -31,26 +31,6 @@ Le projet vise un MVP tres clair :
 - leur donner un comportement **follow + protect**
 - les retirer automatiquement apres **180 secondes reelles**
 
-## Captures
-
-### Mod de donnees FCS
-
-![Mod de donnees FCS](docs/images/fcs-data-mod.png)
-
-*Les templates `DonJ_ArmyOfDead_Warrior_*` existent bien dans le mod FCS.*
-
-### Fenetre native dans Kenshi
-
-![Fenetre terminal au menu principal](docs/images/terminal-main-menu.png)
-
-*La fenetre `DonJ Kenshi Hack` est creee via MyGUI / RE_Kenshi directement dans Kenshi.*
-
-### Terminal actif en jeu
-
-![Terminal actif en jeu](docs/images/terminal-in-game.png)
-
-*Le terminal fonctionne deja en partie chargee avec les commandes `/help` et `/status`.*
-
 ## Etat actuel du projet
 
 ### Ce qui est deja en place
@@ -109,8 +89,6 @@ Les dossiers importants du depot :
   - package du mod pret a copier dans Kenshi
 - `docs/`
   - journal technique des etapes du projet
-- `docs/images/`
-  - captures utiles pour la page GitHub
 - `tests/`
   - tests natifs C++
 
