@@ -64,6 +64,8 @@ namespace
 
     std::array<bool, 256> g_virtualKeyStates = {};
     bool g_lastKnownGameWorldReady = false;
+    MyGUI::Gui* g_lastKnownGuiInstance = nullptr;
+    bool g_gameWorldMainLoopObserved = false;
     std::unordered_map<ArmyHandleId, std::string> g_armyHandleLookup;
 
     struct TerminalUiBootstrapTracker
@@ -190,6 +192,7 @@ namespace
     void DestroyTerminalUi();
     void RefreshTerminalUi();
     void ResetKeyboardEdgeTracking(const char* reason);
+    void SyncMyGuiLifetimeState(const char* sourceName);
     void LatchVirtualKeyState(int virtualKey);
     void PollTerminalToggleHotkey(const char* sourceName);
     void ResetTerminalUiBootstrapState(const char* reason);
@@ -791,8 +794,11 @@ namespace
         }
 
         DebugTraceFormat(
-            "DonJ Kenshi Hack : F10 detecte par polling (%s).",
-            sourceName != nullptr ? sourceName : "source inconnue");
+            "DonJ Kenshi Hack : F10 detecte par polling (%s) | gui=%p | fenetre=%p | gameplay=%s.",
+            sourceName != nullptr ? sourceName : "source inconnue",
+            static_cast<void*>(MyGUI::Gui::getInstancePtr()),
+            static_cast<void*>(g_window),
+            IsGameWorldReady() ? "oui" : "non");
 
         HandleTerminalToggleRequest(sourceName);
         LatchVirtualKeyState(VK_F10);
@@ -824,6 +830,11 @@ namespace
             else
             {
                 ErrorLog("DonJ Kenshi Hack : F10 n'a pas pu creer le terminal.");
+                DebugTraceFormat(
+                    "DonJ Kenshi Hack : echec creation terminal via F10 (%s) | gui=%p | gameplay=%s.",
+                    sourceName != nullptr ? sourceName : "source inconnue",
+                    static_cast<void*>(MyGUI::Gui::getInstancePtr()),
+                    IsGameWorldReady() ? "oui" : "non");
             }
             LatchVirtualKeyState(VK_F10);
             return;
@@ -2196,8 +2207,36 @@ namespace
         DebugLog(logMessage);
     }
 
+    void SyncMyGuiLifetimeState(const char* sourceName)
+    {
+        MyGUI::Gui* currentGuiInstance = MyGUI::Gui::getInstancePtr();
+        if (currentGuiInstance == g_lastKnownGuiInstance)
+        {
+            return;
+        }
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : changement instance MyGUI (%s) | ancienne=%p | nouvelle=%p | fenetre=%p.",
+            sourceName != nullptr ? sourceName : "source inconnue",
+            static_cast<void*>(g_lastKnownGuiInstance),
+            static_cast<void*>(currentGuiInstance),
+            static_cast<void*>(g_window));
+
+        const bool hadTerminalWindow = (g_window != nullptr);
+        g_lastKnownGuiInstance = currentGuiInstance;
+
+        if (hadTerminalWindow)
+        {
+            InvalidateTerminalUi("changement instance MyGUI");
+        }
+
+        ResetTerminalUiBootstrapState("changement instance MyGUI");
+    }
+
     void SyncExecutionContextState()
     {
+        SyncMyGuiLifetimeState("SyncExecutionContextState");
+
         const bool gameWorldReady = IsGameWorldReady();
         if (gameWorldReady == g_lastKnownGameWorldReady)
         {
@@ -2205,6 +2244,14 @@ namespace
         }
 
         g_lastKnownGameWorldReady = gameWorldReady;
+        g_gameWorldMainLoopObserved = false;
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : transition contexte | gameplay=%s | gui=%p | fenetre=%p.",
+            gameWorldReady ? "oui" : "non",
+            static_cast<void*>(MyGUI::Gui::getInstancePtr()),
+            static_cast<void*>(g_window));
+
         if (gameWorldReady)
         {
             g_spawnManager.Reset();
@@ -2213,9 +2260,10 @@ namespace
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
             ResetObservedNaturalSpawnContext();
+
             if (g_window != nullptr)
             {
-                DestroyTerminalUi();
+                SetTerminalUiVisibility(false, "entree en jeu");
             }
 
             ResetKeyboardEdgeTracking("entree en jeu");
@@ -2238,9 +2286,10 @@ namespace
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
             ResetObservedNaturalSpawnContext();
+
             if (g_window != nullptr)
             {
-                DestroyTerminalUi();
+                SetTerminalUiVisibility(false, "retour menu");
             }
 
             ResetKeyboardEdgeTracking("retour menu");
@@ -2281,14 +2330,27 @@ namespace
         if (g_window != nullptr)
         {
             SyncTerminalUiRuntimeState();
+            DebugTraceFormat(
+                "DonJ Kenshi Hack : TryCreateTerminalUi ignore, fenetre deja presente | gui=%p | window=%p | gameplay=%s.",
+                static_cast<void*>(MyGUI::Gui::getInstancePtr()),
+                static_cast<void*>(g_window),
+                IsGameWorldReady() ? "oui" : "non");
             return true;
         }
 
         MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
         if (gui == nullptr)
         {
+            DebugTraceFormat(
+                "DonJ Kenshi Hack : TryCreateTerminalUi impossible, MyGUI::Gui nul | gameplay=%s.",
+                IsGameWorldReady() ? "oui" : "non");
             return false;
         }
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : TryCreateTerminalUi | gui=%p | gameplay=%s.",
+            static_cast<void*>(gui),
+            IsGameWorldReady() ? "oui" : "non");
 
         ClearTerminalUiPointers();
 
@@ -2307,6 +2369,12 @@ namespace
 
         g_window->setCaption("DonJ Kenshi Hack");
         g_window->setVisible(false);
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : fenetre terminal allouee | gui=%p | window=%p | gameplay=%s.",
+            static_cast<void*>(gui),
+            static_cast<void*>(g_window),
+            IsGameWorldReady() ? "oui" : "non");
 
         MyGUI::Widget* clientWidget = g_window->getClientWidget();
         if (clientWidget == nullptr)
@@ -2411,6 +2479,15 @@ namespace
         SyncTerminalUiRuntimeState();
         g_terminal.MarkUiDirty();
         RefreshTerminalUi();
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : TryCreateTerminalUi OK | window=%p | history=%p | input=%p | button=%p | gameplay=%s.",
+            static_cast<void*>(g_window),
+            static_cast<void*>(g_historyBox),
+            static_cast<void*>(g_inputBox),
+            static_cast<void*>(g_executeButton),
+            IsGameWorldReady() ? "oui" : "non");
+
         return true;
     }
 
@@ -2704,6 +2781,18 @@ namespace
     {
         GameWorld_mainLoop_orig(thisptr, time);
         SyncExecutionContextState();
+
+        if (!g_gameWorldMainLoopObserved)
+        {
+            DebugTraceFormat(
+                "[TRACE] GameWorld_mainLoop_hook observe | this=%p | gui=%p | world=%s | fenetre=%p",
+                static_cast<void*>(thisptr),
+                static_cast<void*>(MyGUI::Gui::getInstancePtr()),
+                IsGameWorldReady() ? "ready" : "not_ready",
+                static_cast<void*>(g_window));
+            g_gameWorldMainLoopObserved = true;
+        }
+
         PollTerminalToggleHotkey("GameWorld::_NV_mainLoop_GPUSensitiveStuff polling");
 
         const ArmySession& sessionBeforeInput = g_terminal.GetArmySession();
