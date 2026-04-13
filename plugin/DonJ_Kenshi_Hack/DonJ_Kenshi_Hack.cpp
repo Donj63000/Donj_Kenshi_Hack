@@ -96,8 +96,31 @@ namespace
         }
     };
 
+    struct HookInstallationState
+    {
+        bool titleScreenConstructorInstalled;
+        bool titleScreenShowInstalled;
+        bool titleScreenUpdateInstalled;
+        bool guiWindowUpdateInstalled;
+        bool inputHandlerKeyDownInstalled;
+        bool gameWorldMainLoopInstalled;
+        bool createRandomCharacterInstalled;
+
+        HookInstallationState()
+            : titleScreenConstructorInstalled(false)
+            , titleScreenShowInstalled(false)
+            , titleScreenUpdateInstalled(false)
+            , guiWindowUpdateInstalled(false)
+            , inputHandlerKeyDownInstalled(false)
+            , gameWorldMainLoopInstalled(false)
+            , createRandomCharacterInstalled(false)
+        {
+        }
+    };
+
     TerminalUiBootstrapTracker g_terminalUiBootstrap;
     TerminalUiRuntimeState g_terminalUiState;
+    HookInstallationState g_hookState;
 
     TitleScreen* (*TitleScreen_orig)(TitleScreen*) = nullptr;
     void (*TitleScreen_show_orig)(TitleScreen*, bool) = nullptr;
@@ -157,10 +180,18 @@ namespace
     void WriteCrashSafeArmyTrace(const std::string& message);
     std::string GetArmyTraceFilePath();
     void ResetObservedNaturalSpawnContext();
+    bool ConsumeVirtualKeyPress(int virtualKey);
     void ClearTerminalUiPointers();
+    void InvalidateTerminalUi(const char* reason);
+    void RecoverTerminalUiFromStructuredException(const char* operationName, unsigned int exceptionCode);
+    bool TryDestroyTerminalUiNoCrash(unsigned int& outExceptionCode);
+    bool TryReadWidgetVisibleNoCrash(MyGUI::Widget* widget, bool& outVisible, unsigned int& outExceptionCode);
+    bool TryReadWidgetAbsoluteRectNoCrash(MyGUI::Widget* widget, MyGUI::IntRect& outRect, unsigned int& outExceptionCode);
     void DestroyTerminalUi();
     void RefreshTerminalUi();
     void ResetKeyboardEdgeTracking(const char* reason);
+    void LatchVirtualKeyState(int virtualKey);
+    void PollTerminalToggleHotkey(const char* sourceName);
     void ResetTerminalUiBootstrapState(const char* reason);
     void SyncExecutionContextState();
     bool TryCreateTerminalUi();
@@ -557,24 +588,130 @@ namespace
         g_terminalUiState.inputActive = g_terminal.IsInputActive();
     }
 
-    void DestroyTerminalUi()
+    void InvalidateTerminalUi(const char* reason)
     {
-        MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
-        if (gui != nullptr && g_window != nullptr)
+        g_terminal.CancelInput(false);
+        ClearTerminalUiPointers();
+        g_terminal.MarkUiDirty();
+        g_terminalUiBootstrap = TerminalUiBootstrapTracker();
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : UI terminal invalidee (%s).",
+            (reason != nullptr && reason[0] != '\0') ? reason : "raison inconnue");
+    }
+
+    void RecoverTerminalUiFromStructuredException(const char* operationName, unsigned int exceptionCode)
+    {
+        char buffer[256] = {};
+        DonjSnprintf(
+            buffer,
+            sizeof(buffer),
+            "DonJ Kenshi Hack : exception structuree 0x%08X pendant %s.",
+            exceptionCode,
+            (operationName != nullptr && operationName[0] != '\0') ? operationName : "operation UI");
+        ErrorLog(buffer);
+        DebugTrace(buffer);
+        InvalidateTerminalUi(operationName);
+    }
+
+    bool TryDestroyTerminalUiNoCrash(unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
         {
-            gui->destroyWidget(g_window);
+            MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+            if (gui != nullptr && g_window != nullptr)
+            {
+                gui->destroyWidget(g_window);
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryReadWidgetVisibleNoCrash(MyGUI::Widget* widget, bool& outVisible, unsigned int& outExceptionCode)
+    {
+        outVisible = false;
+        outExceptionCode = 0;
+
+        if (widget == nullptr)
+        {
+            return true;
         }
 
+        __try
+        {
+            outVisible = widget->getVisible();
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryReadWidgetAbsoluteRectNoCrash(MyGUI::Widget* widget, MyGUI::IntRect& outRect, unsigned int& outExceptionCode)
+    {
+        outRect = MyGUI::IntRect();
+        outExceptionCode = 0;
+
+        if (widget == nullptr)
+        {
+            return true;
+        }
+
+        __try
+        {
+            outRect = widget->getAbsoluteRect();
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    void DestroyTerminalUi()
+    {
+        unsigned int destroyExceptionCode = 0;
+        if (!TryDestroyTerminalUiNoCrash(destroyExceptionCode))
+        {
+            RecoverTerminalUiFromStructuredException("DestroyTerminalUi", destroyExceptionCode);
+            return;
+        }
+
+        g_terminal.CancelInput(false);
         ClearTerminalUiPointers();
+        g_terminal.MarkUiDirty();
     }
 
     void SyncTerminalUiRuntimeState()
     {
         g_terminalUiState.windowCreated = (g_window != nullptr);
-        g_terminalUiState.consoleVisible =
-            (g_window != nullptr) &&
-            g_window->getVisible();
+        g_terminalUiState.consoleVisible = false;
         g_terminalUiState.inputActive = g_terminal.IsInputActive();
+
+        if (g_window == nullptr)
+        {
+            return;
+        }
+
+        bool visible = false;
+        unsigned int exceptionCode = 0;
+        if (!TryReadWidgetVisibleNoCrash(g_window, visible, exceptionCode))
+        {
+            RecoverTerminalUiFromStructuredException("SyncTerminalUiRuntimeState/getVisible", exceptionCode);
+            return;
+        }
+
+        g_terminalUiState.consoleVisible = visible;
     }
 
     bool SetTerminalUiVisibility(bool visible, const char* sourceName)
@@ -590,7 +727,22 @@ namespace
             g_terminal.CancelInput(false);
         }
 
-        g_window->setVisible(visible);
+        unsigned int exceptionCode = 0;
+        __try
+        {
+            g_window->setVisible(visible);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            exceptionCode = static_cast<unsigned int>(GetExceptionCode());
+        }
+
+        if (exceptionCode != 0)
+        {
+            RecoverTerminalUiFromStructuredException("SetTerminalUiVisibility/setVisible", exceptionCode);
+            return false;
+        }
+
         SyncTerminalUiRuntimeState();
         g_terminal.MarkUiDirty();
         RefreshTerminalUi();
@@ -625,6 +777,27 @@ namespace
         }
     }
 
+    void LatchVirtualKeyState(int virtualKey)
+    {
+        const unsigned int safeIndex = static_cast<unsigned int>(virtualKey) & 0xFFu;
+        g_virtualKeyStates[safeIndex] = (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+    }
+
+    void PollTerminalToggleHotkey(const char* sourceName)
+    {
+        if (!ConsumeVirtualKeyPress(VK_F10))
+        {
+            return;
+        }
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : F10 detecte par polling (%s).",
+            sourceName != nullptr ? sourceName : "source inconnue");
+
+        HandleTerminalToggleRequest(sourceName);
+        LatchVirtualKeyState(VK_F10);
+    }
+
     void HandleTerminalToggleRequest(const char* sourceName)
     {
         SyncExecutionContextState();
@@ -652,18 +825,21 @@ namespace
             {
                 ErrorLog("DonJ Kenshi Hack : F10 n'a pas pu creer le terminal.");
             }
+            LatchVirtualKeyState(VK_F10);
             return;
         }
 
         if (toggleDecision == DonJTerminalUiBootstrap::ShowExistingWindow)
         {
             SetTerminalUiVisibility(true, sourceName);
+            LatchVirtualKeyState(VK_F10);
             return;
         }
 
         if (toggleDecision == DonJTerminalUiBootstrap::HideWindow)
         {
             SetTerminalUiVisibility(false, sourceName);
+            LatchVirtualKeyState(VK_F10);
             return;
         }
 
@@ -674,6 +850,8 @@ namespace
             g_window != nullptr ? "oui" : "non",
             g_terminalUiState.consoleVisible ? "oui" : "non",
             IsGameWorldReady() ? "oui" : "non");
+
+        LatchVirtualKeyState(VK_F10);
     }
 
     void DismissArmyCharacter(Character* character)
@@ -838,12 +1016,32 @@ namespace
 
     bool IsPointInsideWidget(MyGUI::Widget* widget, int x, int y)
     {
-        if (widget == nullptr || !widget->getVisible())
+        if (widget == nullptr)
         {
             return false;
         }
 
-        const MyGUI::IntRect widgetRect = widget->getAbsoluteRect();
+        bool visible = false;
+        unsigned int visibleExceptionCode = 0;
+        if (!TryReadWidgetVisibleNoCrash(widget, visible, visibleExceptionCode))
+        {
+            RecoverTerminalUiFromStructuredException("IsPointInsideWidget/getVisible", visibleExceptionCode);
+            return false;
+        }
+
+        if (!visible)
+        {
+            return false;
+        }
+
+        MyGUI::IntRect widgetRect;
+        unsigned int rectExceptionCode = 0;
+        if (!TryReadWidgetAbsoluteRectNoCrash(widget, widgetRect, rectExceptionCode))
+        {
+            RecoverTerminalUiFromStructuredException("IsPointInsideWidget/getAbsoluteRect", rectExceptionCode);
+            return false;
+        }
+
         return
             x >= widgetRect.left &&
             y >= widgetRect.top &&
@@ -853,6 +1051,9 @@ namespace
 
     void RefreshTerminalUi()
     {
+#if (_MSC_VER == 1600)
+        // La je garde un fallback VC100, car ce compilateur refuse __try
+        // dans ce chemin quand MyGUI manipule des temporaires C++ de texte.
         if (g_historyBox != nullptr && g_terminal.ConsumeOutputDirty())
         {
             g_historyBox->setOnlyText(g_terminal.BuildOutputText());
@@ -865,6 +1066,34 @@ namespace
             g_inputBox->setOnlyText(g_terminal.BuildInputText());
             g_inputBox->setTextCursor(g_inputBox->getTextLength());
         }
+#else
+        unsigned int exceptionCode = 0;
+
+        __try
+        {
+            if (g_historyBox != nullptr && g_terminal.ConsumeOutputDirty())
+            {
+                g_historyBox->setOnlyText(g_terminal.BuildOutputText());
+                g_historyBox->setTextCursor(g_historyBox->getTextLength());
+                g_historyBox->setVScrollPosition(g_historyBox->getVScrollRange());
+            }
+
+            if (g_inputBox != nullptr && g_terminal.ConsumeInputDirty())
+            {
+                g_inputBox->setOnlyText(g_terminal.BuildInputText());
+                g_inputBox->setTextCursor(g_inputBox->getTextLength());
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            exceptionCode = static_cast<unsigned int>(GetExceptionCode());
+        }
+
+        if (exceptionCode != 0)
+        {
+            RecoverTerminalUiFromStructuredException("RefreshTerminalUi", exceptionCode);
+        }
+#endif
     }
 
     bool IsGameWorldReady()
@@ -1225,14 +1454,16 @@ namespace
             return false;
         }
 
-        return RootObjectFactory_createRandomCharacter_orig != nullptr;
+        return
+            g_hookState.createRandomCharacterInstalled &&
+            RootObjectFactory_createRandomCharacter_orig != nullptr;
     }
 
     bool IsArmyReplayHookInstalled()
     {
-        // La j'utilise le flag historique "replay hook" pour signaler que le hook factory
-        // natif est bien installe et peut capturer une vraie instance RootObjectFactory.
-        return RootObjectFactory_createRandomCharacter_orig != nullptr;
+        return
+            g_hookState.createRandomCharacterInstalled &&
+            RootObjectFactory_createRandomCharacter_orig != nullptr;
     }
 
     bool HasNaturalArmySpawnOpportunity()
@@ -1645,6 +1876,15 @@ namespace
     {
         SpawnAttemptResult result;
 
+        if (!g_hookState.createRandomCharacterInstalled ||
+            RootObjectFactory_createRandomCharacter_orig == nullptr)
+        {
+            result.outcome = SpawnAttemptOutcome::DeferredAwaitingReplayHook;
+            result.shouldRequeue = true;
+            result.detail = "[INFO] Spawn differe : hook RootObjectFactory::createRandomCharacter non installe sur cette build.";
+            return result;
+        }
+
         if (!IsArmyReplayHookInstalled())
         {
             result.outcome = SpawnAttemptOutcome::DeferredAwaitingReplayHook;
@@ -1791,6 +2031,24 @@ namespace
         return result;
     }
 
+    bool TryTickArmyReplayNoCrash(std::size_t& outSpawnedByReplay, unsigned int& outExceptionCode)
+    {
+        outSpawnedByReplay = 0;
+        outExceptionCode = 0;
+
+        __try
+        {
+            ArmySession& session = g_terminal.GetArmySession();
+            outSpawnedByReplay = g_spawnManager.Tick(session, 0.0f);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
     RootObject* RootObjectFactory_createRandomCharacter_hook(
         RootObjectFactory* thisptr,
         Faction* faction,
@@ -1800,6 +2058,12 @@ namespace
         Building* home,
         float age)
     {
+        if (RootObjectFactory_createRandomCharacter_orig == nullptr)
+        {
+            DebugTrace("[ERREUR] RootObjectFactory_createRandomCharacter_hook : pointeur original nul.");
+            return nullptr;
+        }
+
         if (g_armyReplayDepth == 0)
         {
             g_lastObservedArmyFactory = thisptr;
@@ -1843,8 +2107,27 @@ namespace
 
             ArmySession& session = g_terminal.GetArmySession();
             TraceArmySessionPoint("hook factory avant replay", session);
-            const std::size_t spawnedByReplay = g_spawnManager.Tick(session, 0.0f);
-            if (spawnedByReplay > 0)
+
+            std::size_t spawnedByReplay = 0;
+            unsigned int replayExceptionCode = 0;
+            const bool replaySucceeded = TryTickArmyReplayNoCrash(spawnedByReplay, replayExceptionCode);
+
+            if (!replaySucceeded)
+            {
+                DebugTraceFormat(
+                    "[ERREUR] Replay /army dans RootObjectFactory::createRandomCharacter : exception structuree 0x%08X. Session neutralisee defensivement.",
+                    replayExceptionCode);
+
+                g_spawnManager.Reset();
+                session.pendingRequests.clear();
+                session.pendingFinalizeUnits.clear();
+                session.pendingRequestCount = 0;
+                session.waitingForReplayOpportunity = false;
+                session.active = false;
+                session.remainingSeconds = 0.0f;
+                session.state = ArmyState::Dismissing;
+            }
+            else if (spawnedByReplay > 0)
             {
                 DebugTraceFormat(
                     "[TRACE] RootObjectFactory::createRandomCharacter replay succes | spawned=%zu",
@@ -1930,10 +2213,11 @@ namespace
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
             ResetObservedNaturalSpawnContext();
-            if (g_window != nullptr && g_terminalUiState.consoleVisible)
+            if (g_window != nullptr)
             {
-                SetTerminalUiVisibility(false, "entree en jeu");
+                DestroyTerminalUi();
             }
+
             ResetKeyboardEdgeTracking("entree en jeu");
             ResetTerminalUiBootstrapState("entree en jeu");
         }
@@ -1948,17 +2232,18 @@ namespace
             }
 
             g_spawnManager.Reset();
-            ResetKeyboardEdgeTracking("retour menu");
             g_armyHandleLookup.clear();
             g_lastObservedArmyFactory = nullptr;
             g_currentArmyReplayFactory = nullptr;
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
             ResetObservedNaturalSpawnContext();
-            if (g_window != nullptr && g_terminalUiState.consoleVisible)
+            if (g_window != nullptr)
             {
-                SetTerminalUiVisibility(false, "retour menu");
+                DestroyTerminalUi();
             }
+
+            ResetKeyboardEdgeTracking("retour menu");
             ResetTerminalUiBootstrapState("retour menu");
         }
     }
@@ -2331,6 +2616,7 @@ namespace
         if (keyCode == OIS::KC_F10)
         {
             HandleTerminalToggleRequest("InputHandler::keyDownEvent");
+            LatchVirtualKeyState(VK_F10);
             SyncTerminalUiRuntimeState();
             if (!g_terminalUiState.consoleVisible)
             {
@@ -2377,6 +2663,7 @@ namespace
             g_titleScreenUpdateObserved = true;
         }
         MaybeBootstrapTerminalUi("TitleScreen::_NV_update", thisptr != nullptr);
+        PollTerminalToggleHotkey("TitleScreen::_NV_update polling");
 
         if (g_window == nullptr)
         {
@@ -2409,12 +2696,15 @@ namespace
             // bootstrap si TitleScreen ne declenche pas la creation sur cette build.
             MaybeBootstrapTerminalUi("GUIWindow::_NV_update (fallback)", true);
         }
+
+        PollTerminalToggleHotkey("GUIWindow::_NV_update polling");
     }
 
     void GameWorld_mainLoop_hook(GameWorld* thisptr, float time)
     {
         GameWorld_mainLoop_orig(thisptr, time);
         SyncExecutionContextState();
+        PollTerminalToggleHotkey("GameWorld::_NV_mainLoop_GPUSensitiveStuff polling");
 
         const ArmySession& sessionBeforeInput = g_terminal.GetArmySession();
         if (ShouldTraceArmyTick(sessionBeforeInput))
@@ -2627,77 +2917,108 @@ __declspec(dllexport) void startPlugin()
     };
     g_armyRuntime.SetEnvironment(armyRuntimeEnvironment);
 
-    if (!InstallArmyHookFromRva(
+    g_hookState.titleScreenConstructorInstalled =
+        InstallArmyHookFromRva(
             "TitleScreen::_CONSTRUCTOR",
             DonJHookAddressResolver::kTitleScreenConstructorRva,
             TitleScreen_hook,
             &TitleScreen_orig,
-            false))
+            false);
+
+    if (!g_hookState.titleScreenConstructorInstalled)
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook TitleScreen::_CONSTRUCTOR.");
     }
 
-    if (!InstallArmyHookFromRva(
+    g_hookState.titleScreenShowInstalled =
+        InstallArmyHookFromRva(
             "TitleScreen::_NV_show",
             DonJHookAddressResolver::kTitleScreenShowRva,
             TitleScreen_show_hook,
             &TitleScreen_show_orig,
-            false))
+            false);
+
+    if (!g_hookState.titleScreenShowInstalled)
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook TitleScreen::_NV_show.");
     }
 
-    if (!InstallArmyHookFromRva(
+    g_hookState.titleScreenUpdateInstalled =
+        InstallArmyHookFromRva(
             "TitleScreen::_NV_update",
             DonJHookAddressResolver::kTitleScreenUpdateRva,
             TitleScreen_update_hook,
             &TitleScreen_update_orig,
-            true))
+            true);
+
+    if (!g_hookState.titleScreenUpdateInstalled)
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook TitleScreen::_NV_update.");
         return;
     }
 
-    if (!InstallArmyHookFromRva(
+    g_hookState.guiWindowUpdateInstalled =
+        InstallArmyHookFromRva(
             "GUIWindow::_NV_update",
             DonJHookAddressResolver::kGuiWindowUpdateRva,
             GUIWindow_update_hook,
             &GUIWindow_update_orig,
-            false))
+            false);
+
+    if (!g_hookState.guiWindowUpdateInstalled)
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook GUIWindow::_NV_update.");
     }
 
-    if (!InstallArmyHookFromRva(
+    g_hookState.inputHandlerKeyDownInstalled =
+        InstallArmyHookFromRva(
             "InputHandler::keyDownEvent",
             DonJHookAddressResolver::kInputHandlerKeyDownEventRva,
             InputHandler_keyDownEvent_hook,
             &InputHandler_keyDownEvent_orig,
-            false))
+            false);
+
+    if (!g_hookState.inputHandlerKeyDownInstalled)
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook InputHandler::keyDownEvent.");
     }
 
-    if (!InstallArmyHookFromRva(
+    g_hookState.gameWorldMainLoopInstalled =
+        InstallArmyHookFromRva(
             "GameWorld::_NV_mainLoop_GPUSensitiveStuff",
             DonJHookAddressResolver::kGameWorldMainLoopRva,
             GameWorld_mainLoop_hook,
             &GameWorld_mainLoop_orig,
-            true))
+            true);
+
+    if (!g_hookState.gameWorldMainLoopInstalled)
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook GameWorld::_NV_mainLoop_GPUSensitiveStuff.");
         return;
     }
 
-    if (!InstallArmyHookFromRva(
+    g_hookState.createRandomCharacterInstalled =
+        InstallArmyHookFromRva(
             "RootObjectFactory::createRandomCharacter",
             DonJHookAddressResolver::kCreateRandomCharacterRva,
             RootObjectFactory_createRandomCharacter_hook,
             &RootObjectFactory_createRandomCharacter_orig,
-            false))
+            false);
+
+    if (!g_hookState.createRandomCharacterInstalled)
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook RootObjectFactory::createRandomCharacter.");
     }
+
+    DebugTraceFormat(
+        "DonJ Kenshi Hack : etat hooks | title_ctor=%s | title_show=%s | title_update=%s | gui_update=%s | input_key=%s | game_loop=%s | factory_create=%s",
+        g_hookState.titleScreenConstructorInstalled ? "ok" : "ko",
+        g_hookState.titleScreenShowInstalled ? "ok" : "ko",
+        g_hookState.titleScreenUpdateInstalled ? "ok" : "ko",
+        g_hookState.guiWindowUpdateInstalled ? "ok" : "ko",
+        g_hookState.inputHandlerKeyDownInstalled ? "ok" : "ko",
+        g_hookState.gameWorldMainLoopInstalled ? "ok" : "ko",
+        g_hookState.createRandomCharacterInstalled ? "ok" : "ko");
 
     ResetTerminalUiBootstrapState("start plugin");
     DebugLog("DonJ Kenshi Hack : hooks TitleScreen et game tick installes.");
