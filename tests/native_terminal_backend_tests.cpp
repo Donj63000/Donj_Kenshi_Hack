@@ -1,8 +1,10 @@
 #include "ArmyDiagnostics.h"
 #include "CommandRegistry.h"
+#include "HookAddressResolver.h"
 #include "ArmyRuntimeManager.h"
 #include "RuntimeIdentity.h"
 #include "SpawnManager.h"
+#include "TerminalUiBootstrap.h"
 #include "TerminalBackend.h"
 
 #include <cassert>
@@ -62,6 +64,127 @@ namespace
 
         const std::string output = backend.BuildOutputText();
         assert(output.find("Commande inconnue") != std::string::npos);
+    }
+
+    void TestHookAddressResolverBuildsAbsoluteAddressFromRva()
+    {
+        const std::uintptr_t moduleBase = 0x140000000ull;
+        const std::uintptr_t resolved = DonJHookAddressResolver::ResolveModuleRva(
+            moduleBase,
+            DonJHookAddressResolver::kTitleScreenConstructorRva);
+
+        assert(resolved == (moduleBase + DonJHookAddressResolver::kTitleScreenConstructorRva));
+        assert(DonJHookAddressResolver::ResolveModuleRva(0, DonJHookAddressResolver::kTitleScreenUpdateRva) == 0);
+        assert(DonJHookAddressResolver::ResolveModuleRva(moduleBase, 0) == 0);
+    }
+
+    void TestTerminalUiBootstrapAttemptsCreationFromTitleScreenMenu()
+    {
+        const DonJTerminalUiBootstrap::Decision decision = DonJTerminalUiBootstrap::Evaluate(
+            DonJTerminalUiBootstrap::Context(true, true, false, false),
+            DonJTerminalUiBootstrap::NotCreated);
+
+        assert(decision == DonJTerminalUiBootstrap::AttemptCreate);
+    }
+
+    void TestTerminalUiBootstrapSkipsCreationWhenWindowAlreadyExists()
+    {
+        const DonJTerminalUiBootstrap::Decision decision = DonJTerminalUiBootstrap::Evaluate(
+            DonJTerminalUiBootstrap::Context(true, true, true, false),
+            DonJTerminalUiBootstrap::NotCreated);
+
+        assert(decision == DonJTerminalUiBootstrap::WindowAlreadyPresent);
+    }
+
+    void TestTerminalUiBootstrapSkipsCreationDuringGameplay()
+    {
+        const DonJTerminalUiBootstrap::Decision decision = DonJTerminalUiBootstrap::Evaluate(
+            DonJTerminalUiBootstrap::Context(true, true, false, true),
+            DonJTerminalUiBootstrap::NotCreated);
+
+        assert(decision == DonJTerminalUiBootstrap::Skip);
+    }
+
+    void TestTerminalUiBootstrapDetectsGuiUnavailable()
+    {
+        const DonJTerminalUiBootstrap::Decision decision = DonJTerminalUiBootstrap::Evaluate(
+            DonJTerminalUiBootstrap::Context(true, false, false, false),
+            DonJTerminalUiBootstrap::NotCreated);
+
+        assert(decision == DonJTerminalUiBootstrap::GuiUnavailable);
+    }
+
+    void TestTerminalUiBootstrapSkipsAfterFailedAttempt()
+    {
+        const DonJTerminalUiBootstrap::Decision decision = DonJTerminalUiBootstrap::Evaluate(
+            DonJTerminalUiBootstrap::Context(true, true, false, false),
+            DonJTerminalUiBootstrap::Failed);
+
+        assert(decision == DonJTerminalUiBootstrap::Skip);
+    }
+
+    void TestTerminalUiToggleCreatesAndShowsWindowOnF10InGameplay()
+    {
+        const DonJTerminalUiBootstrap::ToggleDecision decision =
+            DonJTerminalUiBootstrap::EvaluateToggle(
+                DonJTerminalUiBootstrap::ToggleContext(true, true, false, false, true));
+
+        assert(decision == DonJTerminalUiBootstrap::CreateAndShowWindow);
+    }
+
+    void TestTerminalUiToggleShowsExistingWindowOnF10InGameplay()
+    {
+        const DonJTerminalUiBootstrap::ToggleDecision decision =
+            DonJTerminalUiBootstrap::EvaluateToggle(
+                DonJTerminalUiBootstrap::ToggleContext(true, true, true, false, true));
+
+        assert(decision == DonJTerminalUiBootstrap::ShowExistingWindow);
+    }
+
+    void TestTerminalUiToggleHidesVisibleWindowOnF10InGameplay()
+    {
+        const DonJTerminalUiBootstrap::ToggleDecision decision =
+            DonJTerminalUiBootstrap::EvaluateToggle(
+                DonJTerminalUiBootstrap::ToggleContext(true, true, true, true, true));
+
+        assert(decision == DonJTerminalUiBootstrap::HideWindow);
+    }
+
+    void TestTerminalUiToggleAlsoWorksFromMenuWhenGuiIsReady()
+    {
+        const DonJTerminalUiBootstrap::ToggleDecision decision =
+            DonJTerminalUiBootstrap::EvaluateToggle(
+                DonJTerminalUiBootstrap::ToggleContext(true, true, true, false, false));
+
+        assert(decision == DonJTerminalUiBootstrap::ShowExistingWindow);
+    }
+
+    void TestTerminalUiToggleIgnoresMenuWhenGuiIsUnavailable()
+    {
+        const DonJTerminalUiBootstrap::ToggleDecision decision =
+            DonJTerminalUiBootstrap::EvaluateToggle(
+                DonJTerminalUiBootstrap::ToggleContext(true, false, false, false, false));
+
+        assert(decision == DonJTerminalUiBootstrap::IgnoreToggle);
+    }
+
+    void TestTerminalUiHiddenWindowDoesNotCaptureKeyboard()
+    {
+        assert(!DonJTerminalUiBootstrap::ShouldCaptureKeyboard(true, false));
+        assert(!DonJTerminalUiBootstrap::ShouldCaptureKeyboard(false, false));
+        assert(DonJTerminalUiBootstrap::ShouldCaptureKeyboard(true, true));
+    }
+
+    void TestClosingConsoleCancelsInputAndClearsBuffer()
+    {
+        TerminalBackend backend;
+
+        backend.ActivateInput();
+        backend.SetInputBuffer("/help");
+        backend.CancelInput();
+
+        assert(!backend.IsInputActive());
+        assert(backend.GetInputBuffer().empty());
     }
 
 
@@ -125,6 +248,48 @@ namespace
 
         const std::string output = backend.BuildOutputText();
         assert(output.find("[INFO] /army refusee : aucune partie chargee.") != std::string::npos);
+    }
+
+    void TestArmyRefusesWhenFactoryIsUnavailable()
+    {
+        TerminalBackend backend;
+        backend.SetArmyCommandEnvironment({
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            [](const std::string&) {},
+            []() { return false; },
+            []() { return true; }
+        });
+
+        backend.SetInputBuffer("/army");
+        backend.SubmitCurrentInput();
+        backend.ProcessPendingCommands();
+
+        const std::string output = backend.BuildOutputText();
+        assert(output.find("[INFO] /army refusee : factory Kenshi indisponible.") != std::string::npos);
+    }
+
+    void TestArmyRefusesWhenReplayHookIsUnavailable()
+    {
+        TerminalBackend backend;
+        backend.SetArmyCommandEnvironment({
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            []() { return true; },
+            [](const std::string&) {},
+            []() { return true; },
+            []() { return false; }
+        });
+
+        backend.SetInputBuffer("/army");
+        backend.SubmitCurrentInput();
+        backend.ProcessPendingCommands();
+
+        const std::string output = backend.BuildOutputText();
+        assert(output.find("[INFO] /army refusee : hook de replay Kenshi indisponible.") != std::string::npos);
     }
 
     void TestCommandHistoryNavigation()
@@ -543,7 +708,8 @@ namespace
         assert(session.pendingRequestCount == 0);
         assert(session.state == ArmyState::Active);
         assert(session.active);
-        assert(session.activeUnits.size() == 30);
+        assert(session.activeUnits.empty());
+        assert(session.pendingFinalizeUnits.empty());
         assert(session.totalSpawnAttempts == 30);
         assert(session.failedSpawnAttempts == 0);
     }
@@ -654,7 +820,6 @@ namespace
 
         ArmySession session;
         session.state = ArmyState::Spawning;
-        session.activeUnits.push_back(minion);
         SpawnRequest request;
         request.templateName = "DonJ_ArmyOfDead_Warrior_A";
         request.index = 0;
@@ -663,15 +828,25 @@ namespace
         assert(configured);
         assert(session.leaderHandleId == 11);
         assert(session.leaderPlatoonHandleId == 101);
+        assert(!session.factionBootstrappedFromLeader);
+        assert(session.pendingFinalizeUnits.size() == 1);
+        assert(session.pendingFinalizeUnits.front().handleId == 22);
+        assert(session.activeUnitHandleIds.empty());
+        assert(appliedFaction == nullptr);
+        assert(appliedPlatoon == nullptr);
+        assert(followLeader == nullptr);
+        assert(orders.empty());
+        assert(roleAssignments == 0);
+        assert(rethinkCalls == 0);
+        assert(renamedCharacter.empty());
+
+        manager.Tick(session, 0.10f);
+        assert(session.pendingFinalizeUnits.empty());
         assert(session.factionBootstrappedFromLeader);
         assert(session.activeUnitHandleIds.size() == 1);
         assert(session.activeUnitHandleIds.front() == 22);
         assert(appliedFaction == leaderFaction);
         assert(appliedPlatoon == activePlatoon);
-        assert(followLeader == nullptr);
-        assert(orders.empty());
-        assert(roleAssignments == 0);
-        assert(rethinkCalls == 0);
         assert(!renamedCharacter.empty());
 
         const float dx = teleportedPosition.x - 10.0f;
@@ -997,6 +1172,7 @@ namespace
         session.leaderHandleId = 101;
         session.leaderPlatoonHandleId = 202;
         session.pendingRequests.push_back({ "DonJ_ArmyOfDead_Warrior_A", 12 });
+        session.pendingFinalizeUnits.push_back({ { "DonJ_ArmyOfDead_Warrior_A", 13 }, 304, 2 });
         session.activeUnitHandleIds.push_back(303);
         session.activeUnits.push_back(dismissedCharacter);
 
@@ -1020,6 +1196,7 @@ namespace
         assert(session.leaderHandleId == 0);
         assert(session.leaderPlatoonHandleId == 0);
         assert(session.pendingRequests.empty());
+        assert(session.pendingFinalizeUnits.empty());
         assert(session.activeUnitHandleIds.empty());
         assert(session.activeUnits.empty());
     }
@@ -1158,9 +1335,24 @@ int main()
     TestArmySpecValues();
     TestHelpCommandWritesHistory();
     TestUnknownCommandIsRejected();
+    TestHookAddressResolverBuildsAbsoluteAddressFromRva();
+    TestTerminalUiBootstrapAttemptsCreationFromTitleScreenMenu();
+    TestTerminalUiBootstrapSkipsCreationWhenWindowAlreadyExists();
+    TestTerminalUiBootstrapSkipsCreationDuringGameplay();
+    TestTerminalUiBootstrapDetectsGuiUnavailable();
+    TestTerminalUiBootstrapSkipsAfterFailedAttempt();
+    TestTerminalUiToggleCreatesAndShowsWindowOnF10InGameplay();
+    TestTerminalUiToggleShowsExistingWindowOnF10InGameplay();
+    TestTerminalUiToggleHidesVisibleWindowOnF10InGameplay();
+    TestTerminalUiToggleAlsoWorksFromMenuWhenGuiIsReady();
+    TestTerminalUiToggleIgnoresMenuWhenGuiIsUnavailable();
+    TestTerminalUiHiddenWindowDoesNotCaptureKeyboard();
+    TestClosingConsoleCancelsInputAndClearsBuffer();
     TestArmyCommandPreparesSessionAndQueue();
     TestArmyTestCommandAcceptsReducedVolumes();
     TestArmyRefusesWhenGameIsNotLoaded();
+    TestArmyRefusesWhenFactoryIsUnavailable();
+    TestArmyRefusesWhenReplayHookIsUnavailable();
     TestCommandHistoryNavigation();
     TestSubmitQueuesWithoutImmediateExecution();
     TestTerminalTraceMilestonesRemainVisible();

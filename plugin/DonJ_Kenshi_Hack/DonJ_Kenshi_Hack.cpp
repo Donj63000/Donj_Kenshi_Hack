@@ -1,14 +1,18 @@
 #include "ArmyDiagnostics.h"
 #include "ArmyCommandSpec.h"
 #include "ArmyRuntimeManager.h"
+#include "BuildGuard.h"
+#include "HookAddressResolver.h"
 #include "RuntimeIdentity.h"
 #include "SpawnManager.h"
+#include "TerminalUiBootstrap.h"
 #include "TerminalBackend.h"
 
 #include <Debug.h>
 
 #include <array>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -46,7 +50,7 @@
 
 namespace
 {
-    constexpr const char* kArmyBuildStamp = __DATE__ " " __TIME__;
+    const char* kArmyBuildStamp = __DATE__ " " __TIME__;
 
     TerminalBackend g_terminal;
     SpawnManager g_spawnManager;
@@ -62,8 +66,44 @@ namespace
     bool g_lastKnownGameWorldReady = false;
     std::unordered_map<ArmyHandleId, std::string> g_armyHandleLookup;
 
+    struct TerminalUiBootstrapTracker
+    {
+        DonJTerminalUiBootstrap::State state;
+        bool attemptLogged;
+        bool alreadyPresentLogged;
+        bool guiUnavailableLogged;
+
+        TerminalUiBootstrapTracker()
+            : state(DonJTerminalUiBootstrap::NotCreated)
+            , attemptLogged(false)
+            , alreadyPresentLogged(false)
+            , guiUnavailableLogged(false)
+        {
+        }
+    };
+
+    struct TerminalUiRuntimeState
+    {
+        bool windowCreated;
+        bool consoleVisible;
+        bool inputActive;
+
+        TerminalUiRuntimeState()
+            : windowCreated(false)
+            , consoleVisible(false)
+            , inputActive(false)
+        {
+        }
+    };
+
+    TerminalUiBootstrapTracker g_terminalUiBootstrap;
+    TerminalUiRuntimeState g_terminalUiState;
+
     TitleScreen* (*TitleScreen_orig)(TitleScreen*) = nullptr;
+    void (*TitleScreen_show_orig)(TitleScreen*, bool) = nullptr;
     void (*TitleScreen_update_orig)(TitleScreen*) = nullptr;
+    void (*GUIWindow_update_orig)(GUIWindow*) = nullptr;
+    void (*InputHandler_keyDownEvent_orig)(InputHandler*, OIS::KeyCode) = nullptr;
     void (*GameWorld_mainLoop_orig)(GameWorld*, float) = nullptr;
     RootObject* (*RootObjectFactory_createRandomCharacter_orig)(
         RootObjectFactory*,
@@ -77,15 +117,28 @@ namespace
     RootObjectFactory* g_currentArmyReplayFactory = nullptr;
     bool g_armyReplayOpportunityActive = false;
     int g_armyReplayDepth = 0;
+    bool g_titleScreenUpdateObserved = false;
+    bool g_guiWindowUpdateObserved = false;
+    bool g_inputHandlerKeyObserved = false;
 
     struct ObservedNaturalSpawnContext
     {
-        RootObjectFactory* factory = nullptr;
-        Faction* faction = nullptr;
-        RootObjectContainer* owner = nullptr;
-        Building* home = nullptr;
-        float age = 1.0f;
-        bool valid = false;
+        RootObjectFactory* factory;
+        Faction* faction;
+        RootObjectContainer* owner;
+        Building* home;
+        float age;
+        bool valid;
+
+        ObservedNaturalSpawnContext()
+            : factory(nullptr)
+            , faction(nullptr)
+            , owner(nullptr)
+            , home(nullptr)
+            , age(1.0f)
+            , valid(false)
+        {
+        }
     };
 
     ObservedNaturalSpawnContext g_observedNaturalSpawnContext;
@@ -96,13 +149,105 @@ namespace
     bool HasNaturalArmySpawnOpportunity();
     Platoon* GetCurrentArmyPlayerPlatoon();
     ArmyHandleId RegisterArmyHandleId(const hand& handleValue);
+    hand ResolveArmyHandleId(ArmyHandleId handleId);
     Faction* ResolveArmyPlayerFaction();
     RootObjectContainer* ResolveArmySpawnOwnerContainer();
-    Ogre::Vector3 ComputeArmyFactorySpawnPosition(const SpawnPosition& spawnOrigin, int requestIndex);
+    SpawnPosition ComputeArmyFactorySpawnPosition(const SpawnPosition& spawnOrigin, int requestIndex);
     Character* ResolveArmyCharacterFromCreatedRoot(RootObject* createdRoot);
     void WriteCrashSafeArmyTrace(const std::string& message);
     std::string GetArmyTraceFilePath();
     void ResetObservedNaturalSpawnContext();
+    void ClearTerminalUiPointers();
+    void DestroyTerminalUi();
+    void RefreshTerminalUi();
+    void ResetKeyboardEdgeTracking(const char* reason);
+    void ResetTerminalUiBootstrapState(const char* reason);
+    void SyncExecutionContextState();
+    bool TryCreateTerminalUi();
+    void MaybeBootstrapTerminalUi(const char* sourceName, bool hasTitleScreenContext);
+    void SyncTerminalUiRuntimeState();
+    bool SetTerminalUiVisibility(bool visible, const char* sourceName);
+    void HandleTerminalToggleRequest(const char* sourceName);
+    void DebugTrace(const std::string& message);
+    void DebugTraceFormat(const char* format, ...);
+    intptr_t ResolveArmyHookTargetFromRva(std::uintptr_t rva)
+    {
+        const HMODULE gameModule = GetModuleHandleA(nullptr);
+        if (gameModule == nullptr)
+        {
+            return 0;
+        }
+
+        return static_cast<intptr_t>(
+            DonJHookAddressResolver::ResolveModuleRva(
+                reinterpret_cast<std::uintptr_t>(gameModule),
+                rva));
+    }
+
+    template <typename TOriginal>
+    bool InstallArmyHookFromRva(
+        const char* hookName,
+        std::uintptr_t rva,
+        void* detour,
+        TOriginal** original,
+        bool required)
+    {
+        const intptr_t target = ResolveArmyHookTargetFromRva(rva);
+
+        DebugTraceFormat(
+            "[TRACE] InstallArmyHookFromRva | hook=%s | rva=0x%I64X | target=%p",
+            hookName,
+            static_cast<unsigned long long>(rva),
+            reinterpret_cast<void*>(target));
+
+        if (target == 0)
+        {
+            char buffer[256] = {};
+            DonjSnprintf(
+                buffer,
+                sizeof(buffer),
+                "DonJ Kenshi Hack : adresse hook introuvable pour %s (RVA=0x%I64X).",
+                hookName,
+                static_cast<unsigned long long>(rva));
+            ErrorLog(buffer);
+            DebugTrace(buffer);
+            return false;
+        }
+
+        if (KenshiLib::SUCCESS != KenshiLib::AddHook(target, detour, original))
+        {
+            char buffer[256] = {};
+            DonjSnprintf(
+                buffer,
+                sizeof(buffer),
+                "DonJ Kenshi Hack : impossible d'installer le hook %s via RVA 0x%I64X.",
+                hookName,
+                static_cast<unsigned long long>(rva));
+            ErrorLog(buffer);
+            DebugTrace(buffer);
+            return false;
+        }
+
+        char buffer[256] = {};
+        DonjSnprintf(
+            buffer,
+            sizeof(buffer),
+            "DonJ Kenshi Hack : hook %s installe via RVA 0x%I64X.",
+            hookName,
+            static_cast<unsigned long long>(rva));
+        DebugLog(buffer);
+        DebugTrace(buffer);
+
+        if (!required)
+        {
+            DebugTraceFormat(
+                "[TRACE] InstallArmyHookFromRva optionnel actif | hook=%s",
+                hookName);
+        }
+
+        return true;
+    }
+
     bool TryDismissArmyCharacterNoCrash(Character* character, unsigned int& outExceptionCode);
     bool TryInvokeArmyCreateRandomCharacterNoCrash(
         RootObjectFactory* factory,
@@ -118,6 +263,131 @@ namespace
         RootObject* createdRoot,
         Character*& outCharacter,
         unsigned int& outExceptionCode);
+    bool TryResolveArmyCharacterFromHandleNoCrash(
+        const hand& candidateHandle,
+        Character*& outCharacter,
+        unsigned int& outExceptionCode)
+    {
+        outCharacter = nullptr;
+        outExceptionCode = 0;
+
+        __try
+        {
+            outCharacter = candidateHandle.getCharacter();
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryReadArmyCharacterPositionNoCrash(
+        Character* character,
+        SpawnPosition& outPosition,
+        unsigned int& outExceptionCode)
+    {
+        outPosition.x = 0.0f;
+        outPosition.y = 0.0f;
+        outPosition.z = 0.0f;
+        outExceptionCode = 0;
+
+        if (character == nullptr)
+        {
+            return false;
+        }
+
+        __try
+        {
+            const Ogre::Vector3 position = character->getPosition();
+            outPosition.x = position.x;
+            outPosition.y = position.y;
+            outPosition.z = position.z;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryReadArmyCharacterOwnerNoCrash(
+        Character* character,
+        Faction*& outOwner,
+        unsigned int& outExceptionCode)
+    {
+        outOwner = nullptr;
+        outExceptionCode = 0;
+
+        if (character == nullptr)
+        {
+            return false;
+        }
+
+        __try
+        {
+            outOwner = character->owner;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryRegisterArmyHandleIdNoCrash(
+        Character* character,
+        ArmyHandleId& outHandleId,
+        unsigned int& outExceptionCode)
+    {
+        outHandleId = 0;
+        outExceptionCode = 0;
+
+        if (character == nullptr)
+        {
+            return false;
+        }
+
+        __try
+        {
+            outHandleId = RegisterArmyHandleId(character->getHandle());
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryResolveArmyCharacterHandleIdNoCrash(
+        ArmyHandleId handleId,
+        Character*& outCharacter,
+        unsigned int& outExceptionCode)
+    {
+        outCharacter = nullptr;
+        outExceptionCode = 0;
+
+        if (handleId == 0)
+        {
+            return false;
+        }
+
+        __try
+        {
+            hand resolvedHandle = ResolveArmyHandleId(handleId);
+            outCharacter = resolvedHandle.getCharacter();
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
 
     bool TryResolveArmyLeaderFromHandle(const hand& candidateHandle, Character*& outLeader, ArmyHandleId* outHandleId)
     {
@@ -126,9 +396,28 @@ namespace
             return false;
         }
 
-        Character* resolvedLeader = candidateHandle.getCharacter();
+        Character* resolvedLeader = nullptr;
+        unsigned int resolveExceptionCode = 0;
+        if (!TryResolveArmyCharacterFromHandleNoCrash(candidateHandle, resolvedLeader, resolveExceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] TryResolveArmyLeaderFromHandle : exception structuree 0x%08X pendant handle.getCharacter().",
+                resolveExceptionCode);
+            return false;
+        }
+
         if (resolvedLeader == nullptr)
         {
+            return false;
+        }
+
+        SpawnPosition ignoredLeaderPosition;
+        unsigned int positionExceptionCode = 0;
+        if (!TryReadArmyCharacterPositionNoCrash(resolvedLeader, ignoredLeaderPosition, positionExceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] TryResolveArmyLeaderFromHandle : leader rejete, getPosition() a leve 0x%08X.",
+                positionExceptionCode);
             return false;
         }
 
@@ -159,9 +448,19 @@ namespace
             return leader;
         }
 
-        if (ou->player->playerCharacters.size() > 0)
+        for (std::size_t index = 0; index < ou->player->playerCharacters.size(); ++index)
         {
-            return ou->player->playerCharacters[0];
+            Character* playerCharacter = ou->player->playerCharacters[index];
+            SpawnPosition ignoredLeaderPosition;
+            unsigned int positionExceptionCode = 0;
+            if (TryReadArmyCharacterPositionNoCrash(playerCharacter, ignoredLeaderPosition, positionExceptionCode))
+            {
+                return playerCharacter;
+            }
+
+            DebugTraceFormat(
+                "[TRACE] ResolveArmyLeaderCharacter : personnage joueur rejete, getPosition() a leve 0x%08X.",
+                positionExceptionCode);
         }
 
         return nullptr;
@@ -195,11 +494,17 @@ namespace
         DebugLog(message.c_str());
     }
 
-    template <typename... TArgs>
-    void DebugTraceFormat(const char* format, TArgs... args)
+    void DebugTraceFormat(const char* format, ...)
     {
         char buffer[768] = {};
-        std::snprintf(buffer, sizeof(buffer), format, std::forward<TArgs>(args)...);
+        va_list args;
+        va_start(args, format);
+#if defined(_MSC_VER) && (_MSC_VER <= 1600)
+        _vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, format, args);
+#else
+        std::vsnprintf(buffer, sizeof(buffer), format, args);
+#endif
+        va_end(args);
         WriteCrashSafeArmyTrace(buffer);
         DebugLog(buffer);
     }
@@ -207,7 +512,7 @@ namespace
     std::string BuildArmyBuildMarker()
     {
         char buffer[256] = {};
-        std::snprintf(
+        DonjSnprintf(
             buffer,
             sizeof(buffer),
             "DonJ Kenshi Hack : startPlugin | build=%s | msvc=%u",
@@ -238,6 +543,137 @@ namespace
     void ResetObservedNaturalSpawnContext()
     {
         g_observedNaturalSpawnContext = ObservedNaturalSpawnContext();
+    }
+
+    void ClearTerminalUiPointers()
+    {
+        g_hintLabel = nullptr;
+        g_executeButton = nullptr;
+        g_inputBox = nullptr;
+        g_historyBox = nullptr;
+        g_window = nullptr;
+        g_terminalUiState.windowCreated = false;
+        g_terminalUiState.consoleVisible = false;
+        g_terminalUiState.inputActive = g_terminal.IsInputActive();
+    }
+
+    void DestroyTerminalUi()
+    {
+        MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
+        if (gui != nullptr && g_window != nullptr)
+        {
+            gui->destroyWidget(g_window);
+        }
+
+        ClearTerminalUiPointers();
+    }
+
+    void SyncTerminalUiRuntimeState()
+    {
+        g_terminalUiState.windowCreated = (g_window != nullptr);
+        g_terminalUiState.consoleVisible =
+            (g_window != nullptr) &&
+            g_window->getVisible();
+        g_terminalUiState.inputActive = g_terminal.IsInputActive();
+    }
+
+    bool SetTerminalUiVisibility(bool visible, const char* sourceName)
+    {
+        if (g_window == nullptr)
+        {
+            SyncTerminalUiRuntimeState();
+            return false;
+        }
+
+        if (!visible)
+        {
+            g_terminal.CancelInput(false);
+        }
+
+        g_window->setVisible(visible);
+        SyncTerminalUiRuntimeState();
+        g_terminal.MarkUiDirty();
+        RefreshTerminalUi();
+        ResetKeyboardEdgeTracking(visible ? "console ouverte" : "console fermee");
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : console %s (%s).",
+            visible ? "visible" : "cachee",
+            sourceName != nullptr ? sourceName : "raison inconnue");
+
+        return true;
+    }
+
+    void ResetTerminalUiBootstrapState(const char* reason)
+    {
+        g_terminalUiBootstrap = TerminalUiBootstrapTracker();
+        g_titleScreenUpdateObserved = false;
+        g_guiWindowUpdateObserved = false;
+        g_inputHandlerKeyObserved = false;
+        SyncTerminalUiRuntimeState();
+        if (g_window != nullptr)
+        {
+            g_terminalUiBootstrap.state = DonJTerminalUiBootstrap::Created;
+        }
+
+        if (reason != nullptr && reason[0] != '\0')
+        {
+            DebugTraceFormat(
+                "DonJ Kenshi Hack : bootstrap UI reinitialise (%s) | fenetre=%s.",
+                reason,
+                g_window != nullptr ? "presente" : "absente");
+        }
+    }
+
+    void HandleTerminalToggleRequest(const char* sourceName)
+    {
+        SyncExecutionContextState();
+        SyncTerminalUiRuntimeState();
+
+        const DonJTerminalUiBootstrap::ToggleDecision toggleDecision =
+            DonJTerminalUiBootstrap::EvaluateToggle(
+                DonJTerminalUiBootstrap::ToggleContext(
+                    true,
+                    MyGUI::Gui::getInstancePtr() != nullptr,
+                    g_window != nullptr,
+                    g_terminalUiState.consoleVisible,
+                    IsGameWorldReady()));
+
+        if (toggleDecision == DonJTerminalUiBootstrap::CreateAndShowWindow)
+        {
+            DebugTraceFormat(
+                "DonJ Kenshi Hack : F10 demande la creation puis l'ouverture (%s).",
+                sourceName != nullptr ? sourceName : "source inconnue");
+            if (TryCreateTerminalUi())
+            {
+                SetTerminalUiVisibility(true, sourceName);
+            }
+            else
+            {
+                ErrorLog("DonJ Kenshi Hack : F10 n'a pas pu creer le terminal.");
+            }
+            return;
+        }
+
+        if (toggleDecision == DonJTerminalUiBootstrap::ShowExistingWindow)
+        {
+            SetTerminalUiVisibility(true, sourceName);
+            return;
+        }
+
+        if (toggleDecision == DonJTerminalUiBootstrap::HideWindow)
+        {
+            SetTerminalUiVisibility(false, sourceName);
+            return;
+        }
+
+        DebugTraceFormat(
+            "DonJ Kenshi Hack : F10 ignore (%s) | gui=%s | fenetre=%s | visible=%s | gameplay=%s.",
+            sourceName != nullptr ? sourceName : "source inconnue",
+            MyGUI::Gui::getInstancePtr() != nullptr ? "oui" : "non",
+            g_window != nullptr ? "oui" : "non",
+            g_terminalUiState.consoleVisible ? "oui" : "non",
+            IsGameWorldReady() ? "oui" : "non");
     }
 
     void DismissArmyCharacter(Character* character)
@@ -436,6 +872,20 @@ namespace
         return ou != nullptr && ou->initialized;
     }
 
+    ArmyHandleId HashArmyHandleString(const std::string& value)
+    {
+        const ArmyHandleId prime = 1099511628211ULL;
+        ArmyHandleId hash = 1469598103934665603ULL;
+
+        for (std::size_t index = 0; index < value.size(); ++index)
+        {
+            hash ^= static_cast<unsigned char>(value[index]);
+            hash *= prime;
+        }
+
+        return hash;
+    }
+
     ArmyHandleId RegisterArmyHandleId(const hand& handleValue)
     {
         if (handleValue.isNull())
@@ -444,7 +894,7 @@ namespace
         }
 
         const std::string serialisedHandle = handleValue.toString();
-        ArmyHandleId handleId = static_cast<ArmyHandleId>(std::hash<std::string>{}(serialisedHandle));
+        ArmyHandleId handleId = HashArmyHandleString(serialisedHandle);
         if (handleId == 0)
         {
             handleId = 1;
@@ -452,10 +902,10 @@ namespace
 
         while (true)
         {
-            const auto existingIt = g_armyHandleLookup.find(handleId);
+            std::unordered_map<ArmyHandleId, std::string>::const_iterator existingIt = g_armyHandleLookup.find(handleId);
             if (existingIt == g_armyHandleLookup.end())
             {
-                g_armyHandleLookup.emplace(handleId, serialisedHandle);
+                g_armyHandleLookup[handleId] = serialisedHandle;
                 return handleId;
             }
 
@@ -470,7 +920,7 @@ namespace
 
     hand ResolveArmyHandleId(ArmyHandleId handleId)
     {
-        const auto it = g_armyHandleLookup.find(handleId);
+        std::unordered_map<ArmyHandleId, std::string>::const_iterator it = g_armyHandleLookup.find(handleId);
         if (it == g_armyHandleLookup.end())
         {
             return hand();
@@ -483,13 +933,58 @@ namespace
 
     Character* ResolveArmyCharacterHandleId(ArmyHandleId handleId)
     {
-        if (handleId == 0)
+        Character* resolvedCharacter = nullptr;
+        unsigned int resolveExceptionCode = 0;
+        if (!TryResolveArmyCharacterHandleIdNoCrash(handleId, resolvedCharacter, resolveExceptionCode))
         {
+            DebugTraceFormat(
+                "[TRACE] ResolveArmyCharacterHandleId : exception structuree 0x%08X pendant la resolution du handle %llu.",
+                resolveExceptionCode,
+                static_cast<unsigned long long>(handleId));
             return nullptr;
         }
 
-        hand resolvedHandle = ResolveArmyHandleId(handleId);
-        return resolvedHandle.getCharacter();
+        return resolvedCharacter;
+    }
+
+    bool IsArmyCharacterDeadSafe(Character* character)
+    {
+        if (character == nullptr)
+        {
+            return true;
+        }
+
+        __try
+        {
+            return character->isDead();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            DebugTraceFormat(
+                "[TRACE] IsArmyCharacterDeadSafe : exception structuree 0x%08X.",
+                static_cast<unsigned int>(GetExceptionCode()));
+            return true;
+        }
+    }
+
+    bool IsArmyCharacterUnconsciousSafe(Character* character)
+    {
+        if (character == nullptr)
+        {
+            return false;
+        }
+
+        __try
+        {
+            return character->isUnconcious();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            DebugTraceFormat(
+                "[TRACE] IsArmyCharacterUnconsciousSafe : exception structuree 0x%08X.",
+                static_cast<unsigned int>(GetExceptionCode()));
+            return true;
+        }
     }
 
     void WriteInfoToTerminalAndDebug(const std::string& message)
@@ -637,7 +1132,22 @@ namespace
         }
 
         Character* leader = ResolveArmyLeaderCharacter();
-        return leader != nullptr ? leader->owner : nullptr;
+        if (leader == nullptr)
+        {
+            return nullptr;
+        }
+
+        Faction* resolvedOwner = nullptr;
+        unsigned int ownerExceptionCode = 0;
+        if (!TryReadArmyCharacterOwnerNoCrash(leader, resolvedOwner, ownerExceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] ResolveArmyPlayerFaction : owner inaccessible, exception 0x%08X.",
+                ownerExceptionCode);
+            return nullptr;
+        }
+
+        return resolvedOwner;
     }
 
     RootObjectContainer* ResolveArmySpawnOwnerContainer()
@@ -685,8 +1195,9 @@ namespace
     bool AreArmyTemplatesConfigured()
     {
         const ArmyCommandSpec& spec = GetArmyCommandSpec();
-        for (const char* templateName : spec.templateNames)
+        for (std::size_t index = 0; index < spec.templateNames.size(); ++index)
         {
+            const char* templateName = spec.templateNames[index];
             if (templateName == nullptr || templateName[0] == '\0')
             {
                 return false;
@@ -739,29 +1250,212 @@ namespace
         Character* leader = ResolveArmyLeaderCharacter();
         if (leader == nullptr)
         {
+            DebugTrace("[TRACE] TryResolveArmySpawnOrigin : aucun leader resolvable.");
             return false;
         }
 
-        const Ogre::Vector3 leaderPosition = leader->getPosition();
+        SpawnPosition leaderPosition;
+        unsigned int positionExceptionCode = 0;
+        if (!TryReadArmyCharacterPositionNoCrash(leader, leaderPosition, positionExceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] TryResolveArmySpawnOrigin : getPosition() a leve 0x%08X.",
+                positionExceptionCode);
+            return false;
+        }
+
         outPosition.x = leaderPosition.x;
         outPosition.y = leaderPosition.y;
         outPosition.z = leaderPosition.z;
+        DebugTraceFormat(
+            "[TRACE] TryResolveArmySpawnOrigin succes | leader=%p | pos=(%.2f, %.2f, %.2f)",
+            static_cast<void*>(leader),
+            static_cast<double>(leaderPosition.x),
+            static_cast<double>(leaderPosition.y),
+            static_cast<double>(leaderPosition.z));
         return true;
     }
 
     SpawnPosition GetArmyCharacterPosition(Character* character)
     {
-        if (character == nullptr)
-        {
-            return SpawnPosition();
-        }
-
-        const Ogre::Vector3 position = character->getPosition();
         SpawnPosition spawnPosition;
-        spawnPosition.x = position.x;
-        spawnPosition.y = position.y;
-        spawnPosition.z = position.z;
+        unsigned int positionExceptionCode = 0;
+        if (!TryReadArmyCharacterPositionNoCrash(character, spawnPosition, positionExceptionCode))
+        {
+            if (character != nullptr)
+            {
+                DebugTraceFormat(
+                    "[TRACE] GetArmyCharacterPosition : getPosition() a leve 0x%08X.",
+                    positionExceptionCode);
+            }
+            return spawnPosition;
+        }
         return spawnPosition;
+    }
+
+    bool TryApplyArmyFactionNoCrash(
+        Character* character,
+        Faction* faction,
+        ActivePlatoon* platoon,
+        unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            character->setFaction(faction, platoon);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryRenameArmyCharacterNoCrash(
+        Character* character,
+        const std::string& name,
+        unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            character->setName(name);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryTeleportArmyCharacterNoCrash(
+        Character* character,
+        const SpawnPosition& position,
+        unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            Ogre::Vector3 targetPosition = character->getPosition();
+            targetPosition.x = position.x;
+            targetPosition.y = position.y;
+            targetPosition.z = position.z;
+            character->teleport(targetPosition);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TrySetArmyFollowTargetNoCrash(
+        Character* character,
+        Character* leader,
+        unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            CharMovement* movement = character->getMovement();
+            if (movement != nullptr)
+            {
+                movement->setDestination(leader, HIGH_PRIORITY);
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryApplyArmyEscortOrderNoCrash(
+        Character* character,
+        ArmyEscortOrder order,
+        unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            switch (order)
+            {
+            case ArmyEscortOrder::DefensiveCombat:
+                character->setStandingOrder(MessageForB::M_SET_ORDER_DEFENSIVE_COMBAT, true);
+                break;
+            case ArmyEscortOrder::ChaseTarget:
+                character->setStandingOrder(MessageForB::M_SET_ORDER_CHASE, true);
+                break;
+            default:
+                break;
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TrySetArmyEscortRoleNoCrash(Character* character, unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            character->setSquadMemberType(SQUAD_1);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryRethinkArmyAiNoCrash(Character* character, unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            character->reThinkCurrentAIAction();
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
+    }
+
+    bool TryFindValidArmySpawnPosNoCrash(
+        Ogre::Vector3& inOutCandidate,
+        const Ogre::Vector3& center,
+        unsigned int& outExceptionCode)
+    {
+        outExceptionCode = 0;
+
+        __try
+        {
+            ou->findValidSpawnPos(inOutCandidate, center);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outExceptionCode = static_cast<unsigned int>(GetExceptionCode());
+            return false;
+        }
     }
 
     void ApplyArmyFaction(Character* character, Faction* faction, ActivePlatoon* platoon)
@@ -771,7 +1465,13 @@ namespace
             return;
         }
 
-        character->setFaction(faction, platoon);
+        unsigned int exceptionCode = 0;
+        if (!TryApplyArmyFactionNoCrash(character, faction, platoon, exceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] ApplyArmyFaction : exception structuree 0x%08X.",
+                exceptionCode);
+        }
     }
 
     void RenameArmyCharacter(Character* character, const std::string& name)
@@ -781,7 +1481,13 @@ namespace
             return;
         }
 
-        character->setName(name);
+        unsigned int exceptionCode = 0;
+        if (!TryRenameArmyCharacterNoCrash(character, name, exceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] RenameArmyCharacter : exception structuree 0x%08X.",
+                exceptionCode);
+        }
     }
 
     void TeleportArmyCharacter(Character* character, const SpawnPosition& position)
@@ -791,11 +1497,13 @@ namespace
             return;
         }
 
-        Ogre::Vector3 targetPosition = character->getPosition();
-        targetPosition.x = position.x;
-        targetPosition.y = position.y;
-        targetPosition.z = position.z;
-        character->teleport(targetPosition);
+        unsigned int exceptionCode = 0;
+        if (!TryTeleportArmyCharacterNoCrash(character, position, exceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] TeleportArmyCharacter : exception structuree 0x%08X.",
+                exceptionCode);
+        }
     }
 
     void SetArmyFollowTarget(Character* character, Character* leader)
@@ -805,10 +1513,12 @@ namespace
             return;
         }
 
-        CharMovement* movement = character->getMovement();
-        if (movement != nullptr)
+        unsigned int exceptionCode = 0;
+        if (!TrySetArmyFollowTargetNoCrash(character, leader, exceptionCode))
         {
-            movement->setDestination(leader, HIGH_PRIORITY);
+            DebugTraceFormat(
+                "[TRACE] SetArmyFollowTarget : exception structuree 0x%08X.",
+                exceptionCode);
         }
     }
 
@@ -819,16 +1529,12 @@ namespace
             return;
         }
 
-        switch (order)
+        unsigned int exceptionCode = 0;
+        if (!TryApplyArmyEscortOrderNoCrash(character, order, exceptionCode))
         {
-        case ArmyEscortOrder::DefensiveCombat:
-            character->setStandingOrder(MessageForB::M_SET_ORDER_DEFENSIVE_COMBAT, true);
-            break;
-        case ArmyEscortOrder::ChaseTarget:
-            character->setStandingOrder(MessageForB::M_SET_ORDER_CHASE, true);
-            break;
-        default:
-            break;
+            DebugTraceFormat(
+                "[TRACE] ApplyArmyEscortOrder : exception structuree 0x%08X.",
+                exceptionCode);
         }
     }
 
@@ -839,7 +1545,13 @@ namespace
             return;
         }
 
-        character->setSquadMemberType(SQUAD_1);
+        unsigned int exceptionCode = 0;
+        if (!TrySetArmyEscortRoleNoCrash(character, exceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] SetArmyEscortRole : exception structuree 0x%08X.",
+                exceptionCode);
+        }
     }
 
     void RethinkArmyAi(Character* character)
@@ -849,10 +1561,16 @@ namespace
             return;
         }
 
-        character->reThinkCurrentAIAction();
+        unsigned int exceptionCode = 0;
+        if (!TryRethinkArmyAiNoCrash(character, exceptionCode))
+        {
+            DebugTraceFormat(
+                "[TRACE] RethinkArmyAi : exception structuree 0x%08X.",
+                exceptionCode);
+        }
     }
 
-    Ogre::Vector3 ComputeArmyFactorySpawnPosition(const SpawnPosition& spawnOrigin, int requestIndex)
+    SpawnPosition ComputeArmyFactorySpawnPosition(const SpawnPosition& spawnOrigin, int requestIndex)
     {
         constexpr float kPi = 3.14159265358979323846f;
 
@@ -862,27 +1580,35 @@ namespace
         const float radius = 1.5f + (static_cast<float>(ringIndex) * 1.15f);
         const float angle = (2.0f * kPi * static_cast<float>(slotIndex) / 8.0f) + (static_cast<float>(ringIndex) * 0.33f);
 
-        Character* leader = ResolveArmyLeaderCharacter();
-        if (leader == nullptr)
-        {
-            return ou->getCameraCenter();
-        }
+        DONJ_ALIGNAS_16 unsigned char centerStorage[sizeof(Ogre::Vector3)] = {};
+        DONJ_ALIGNAS_16 unsigned char candidateStorage[sizeof(Ogre::Vector3)] = {};
+        Ogre::Vector3& center = *reinterpret_cast<Ogre::Vector3*>(centerStorage);
+        Ogre::Vector3& candidate = *reinterpret_cast<Ogre::Vector3*>(candidateStorage);
 
-        Ogre::Vector3 center = leader->getPosition();
         center.x = spawnOrigin.x;
         center.y = spawnOrigin.y;
         center.z = spawnOrigin.z;
 
-        Ogre::Vector3 candidate = center;
-        candidate.x += std::cos(angle) * radius;
-        candidate.z += std::sin(angle) * radius;
+        candidate.x = center.x + (std::cos(angle) * radius);
+        candidate.y = center.y;
+        candidate.z = center.z + (std::sin(angle) * radius);
 
         if (IsGameWorldReady())
         {
-            ou->findValidSpawnPos(candidate, center);
+            unsigned int findSpawnExceptionCode = 0;
+            if (!TryFindValidArmySpawnPosNoCrash(candidate, center, findSpawnExceptionCode))
+            {
+                DebugTraceFormat(
+                    "[TRACE] ComputeArmyFactorySpawnPosition : findValidSpawnPos a leve 0x%08X.",
+                    findSpawnExceptionCode);
+            }
         }
 
-        return candidate;
+        SpawnPosition spawnPosition;
+        spawnPosition.x = candidate.x;
+        spawnPosition.y = candidate.y;
+        spawnPosition.z = candidate.z;
+        return spawnPosition;
     }
 
     Character* ResolveArmyCharacterFromCreatedRoot(RootObject* createdRoot)
@@ -955,7 +1681,12 @@ namespace
             return result;
         }
 
-        const Ogre::Vector3 factorySpawnPosition = ComputeArmyFactorySpawnPosition(spawnOrigin, request.index);
+        const SpawnPosition factorySpawnPosition = ComputeArmyFactorySpawnPosition(spawnOrigin, request.index);
+        DONJ_ALIGNAS_16 unsigned char factorySpawnStorage[sizeof(Ogre::Vector3)] = {};
+        Ogre::Vector3& factorySpawnVector = *reinterpret_cast<Ogre::Vector3*>(factorySpawnStorage);
+        factorySpawnVector.x = factorySpawnPosition.x;
+        factorySpawnVector.y = factorySpawnPosition.y;
+        factorySpawnVector.z = factorySpawnPosition.z;
         DebugTraceFormat(
             "[TRACE] TrySpawnArmyUnitThroughFactory tentative | req=%s | template=%p | faction_nat=%p | owner_nat=%p | factory=%p | pos=(%.2f, %.2f, %.2f)",
             request.templateName.c_str(),
@@ -963,9 +1694,9 @@ namespace
             static_cast<void*>(replayContext.faction),
             static_cast<void*>(replayContext.owner),
             static_cast<void*>(replayContext.factory),
-            static_cast<double>(factorySpawnPosition.x),
-            static_cast<double>(factorySpawnPosition.y),
-            static_cast<double>(factorySpawnPosition.z));
+            static_cast<double>(factorySpawnVector.x),
+            static_cast<double>(factorySpawnVector.y),
+            static_cast<double>(factorySpawnVector.z));
 
         ++g_armyReplayDepth;
         RootObject* createdRoot = nullptr;
@@ -973,7 +1704,7 @@ namespace
         const bool factoryCallSucceeded = TryInvokeArmyCreateRandomCharacterNoCrash(
             replayContext.factory,
             replayContext.faction,
-            factorySpawnPosition,
+            factorySpawnVector,
             replayContext.owner,
             templateData,
             replayContext.home,
@@ -1032,12 +1763,27 @@ namespace
             return result;
         }
 
-        RegisterArmyHandleId(createdCharacter->getHandle());
+        ArmyHandleId createdHandleId = 0;
+        unsigned int handleExceptionCode = 0;
+        if (!TryRegisterArmyHandleIdNoCrash(createdCharacter, createdHandleId, handleExceptionCode))
+        {
+            char buffer[320] = {};
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "[ERREUR] Factory Kenshi : exception structuree 0x%08X pendant la lecture du handle du Character cree.",
+                handleExceptionCode);
+            result.outcome = SpawnAttemptOutcome::FailedFactoryCallFatal;
+            result.shouldRequeue = false;
+            result.detail = buffer;
+            return result;
+        }
+
         DebugTraceFormat(
-            "[TRACE] TrySpawnArmyUnitThroughFactory succes | root=%p | character=%p | handle=%s",
+            "[TRACE] TrySpawnArmyUnitThroughFactory succes | root=%p | character=%p | handle_id=%llu",
             static_cast<void*>(createdRoot),
             static_cast<void*>(createdCharacter),
-            createdCharacter->getHandle().toString().c_str());
+            static_cast<unsigned long long>(createdHandleId));
 
         result.outcome = SpawnAttemptOutcome::Spawned;
         result.character = createdCharacter;
@@ -1184,7 +1930,12 @@ namespace
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
             ResetObservedNaturalSpawnContext();
+            if (g_window != nullptr && g_terminalUiState.consoleVisible)
+            {
+                SetTerminalUiVisibility(false, "entree en jeu");
+            }
             ResetKeyboardEdgeTracking("entree en jeu");
+            ResetTerminalUiBootstrapState("entree en jeu");
         }
         else
         {
@@ -1204,6 +1955,11 @@ namespace
             g_armyReplayOpportunityActive = false;
             g_armyReplayDepth = 0;
             ResetObservedNaturalSpawnContext();
+            if (g_window != nullptr && g_terminalUiState.consoleVisible)
+            {
+                SetTerminalUiVisibility(false, "retour menu");
+            }
+            ResetTerminalUiBootstrapState("retour menu");
         }
     }
 
@@ -1235,19 +1991,21 @@ namespace
         TraceArmySessionPoint("apres ProcessPendingCommands", g_terminal.GetArmySession());
     }
 
-    void CreateTerminalUi()
+    bool TryCreateTerminalUi()
     {
         if (g_window != nullptr)
         {
-            return;
+            SyncTerminalUiRuntimeState();
+            return true;
         }
 
         MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
         if (gui == nullptr)
         {
-            ErrorLog("DonJ Kenshi Hack : MyGUI::Gui introuvable.");
-            return;
+            return false;
         }
+
+        ClearTerminalUiPointers();
 
         g_window = gui->createWidgetReal<MyGUI::Window>(
             "Kenshi_WindowCX",
@@ -1259,16 +2017,18 @@ namespace
         if (g_window == nullptr)
         {
             ErrorLog("DonJ Kenshi Hack : impossible de creer la fenetre du terminal.");
-            return;
+            return false;
         }
 
         g_window->setCaption("DonJ Kenshi Hack");
+        g_window->setVisible(false);
 
         MyGUI::Widget* clientWidget = g_window->getClientWidget();
         if (clientWidget == nullptr)
         {
             ErrorLog("DonJ Kenshi Hack : client widget introuvable.");
-            return;
+            DestroyTerminalUi();
+            return false;
         }
 
         MyGUI::Widget* historyPanel = clientWidget->createWidgetReal<MyGUI::Widget>(
@@ -1276,6 +2036,12 @@ namespace
             0.04f, 0.05f, 0.92f, 0.58f,
             MyGUI::Align::Default,
             "DonJHackHistoryPanel");
+        if (historyPanel == nullptr)
+        {
+            ErrorLog("DonJ Kenshi Hack : impossible de creer le panneau d'historique.");
+            DestroyTerminalUi();
+            return false;
+        }
 
         g_historyBox = historyPanel->createWidgetReal<MyGUI::EditBox>(
             "Kenshi_EditBoxStrechEmpty",
@@ -1286,7 +2052,8 @@ namespace
         if (g_historyBox == nullptr)
         {
             ErrorLog("DonJ Kenshi Hack : impossible de creer l'historique du terminal.");
-            return;
+            DestroyTerminalUi();
+            return false;
         }
 
         g_historyBox->setEditReadOnly(true);
@@ -1303,6 +2070,12 @@ namespace
             0.04f, 0.68f, 0.67f, 0.15f,
             MyGUI::Align::Default,
             "DonJHackInputPanel");
+        if (inputPanel == nullptr)
+        {
+            ErrorLog("DonJ Kenshi Hack : impossible de creer le panneau de saisie.");
+            DestroyTerminalUi();
+            return false;
+        }
 
         g_inputBox = inputPanel->createWidgetReal<MyGUI::EditBox>(
             "Kenshi_EditBoxStrechEmpty",
@@ -1313,7 +2086,8 @@ namespace
         if (g_inputBox == nullptr)
         {
             ErrorLog("DonJ Kenshi Hack : impossible de creer la zone de saisie.");
-            return;
+            DestroyTerminalUi();
+            return false;
         }
 
         g_inputBox->setEditReadOnly(true);
@@ -1331,7 +2105,8 @@ namespace
         if (g_executeButton == nullptr)
         {
             ErrorLog("DonJ Kenshi Hack : impossible de creer le bouton Executer.");
-            return;
+            DestroyTerminalUi();
+            return false;
         }
 
         g_executeButton->setCaption("Executer");
@@ -1344,17 +2119,90 @@ namespace
 
         if (g_hintLabel != nullptr)
         {
-            g_hintLabel->setCaption("Entree : ouvrir ou valider | Echap : annuler | Fleches : historique");
+            g_hintLabel->setCaption("F10 : ouvrir ou fermer | Entree : ouvrir ou valider | Echap : annuler");
             g_hintLabel->setTextAlign(MyGUI::Align::Left | MyGUI::Align::VCenter);
         }
 
+        SyncTerminalUiRuntimeState();
         g_terminal.MarkUiDirty();
         RefreshTerminalUi();
-        DebugLog("DonJ Kenshi Hack : fenetre terminal creee.");
+        return true;
+    }
+
+    void MaybeBootstrapTerminalUi(const char* sourceName, bool hasTitleScreenContext)
+    {
+        const DonJTerminalUiBootstrap::Context context(
+            hasTitleScreenContext,
+            MyGUI::Gui::getInstancePtr() != nullptr,
+            g_window != nullptr,
+            IsGameWorldReady());
+
+        const DonJTerminalUiBootstrap::Decision decision =
+            DonJTerminalUiBootstrap::Evaluate(context, g_terminalUiBootstrap.state);
+
+        if (decision == DonJTerminalUiBootstrap::WindowAlreadyPresent)
+        {
+            g_terminalUiBootstrap.state = DonJTerminalUiBootstrap::Created;
+            SyncTerminalUiRuntimeState();
+            if (!g_terminalUiBootstrap.alreadyPresentLogged)
+            {
+                DebugTraceFormat(
+                    "DonJ Kenshi Hack : creation UI ignoree (%s), fenetre deja presente.",
+                    sourceName);
+                g_terminalUiBootstrap.alreadyPresentLogged = true;
+            }
+            return;
+        }
+
+        if (decision == DonJTerminalUiBootstrap::GuiUnavailable)
+        {
+            if (!g_terminalUiBootstrap.guiUnavailableLogged)
+            {
+                ErrorLog("DonJ Kenshi Hack : MyGUI::Gui introuvable.");
+                DebugTraceFormat(
+                    "DonJ Kenshi Hack : creation UI impossible (%s), MyGUI::Gui indisponible.",
+                    sourceName);
+                g_terminalUiBootstrap.guiUnavailableLogged = true;
+            }
+            return;
+        }
+
+        if (decision != DonJTerminalUiBootstrap::AttemptCreate)
+        {
+            return;
+        }
+
+        if (!g_terminalUiBootstrap.attemptLogged)
+        {
+            DebugTraceFormat(
+                "DonJ Kenshi Hack : tentative creation terminal (%s).",
+                sourceName);
+            g_terminalUiBootstrap.attemptLogged = true;
+        }
+
+        if (TryCreateTerminalUi())
+        {
+            g_terminalUiBootstrap.state = DonJTerminalUiBootstrap::Created;
+            SyncTerminalUiRuntimeState();
+            DebugLog("DonJ Kenshi Hack : fenetre terminal creee.");
+            DebugTraceFormat("DonJ Kenshi Hack : creation UI OK (%s).", sourceName);
+            return;
+        }
+
+        g_terminalUiBootstrap.state = DonJTerminalUiBootstrap::Failed;
+        DebugTraceFormat("DonJ Kenshi Hack : creation UI en echec (%s).", sourceName);
     }
 
     void ProcessTerminalMouseInput()
     {
+        SyncTerminalUiRuntimeState();
+        if (!DonJTerminalUiBootstrap::ShouldCaptureKeyboard(
+                g_terminalUiState.windowCreated,
+                g_terminalUiState.consoleVisible))
+        {
+            return;
+        }
+
         if (key == nullptr || !key->mLUp)
         {
             return;
@@ -1366,6 +2214,7 @@ namespace
         if (IsPointInsideWidget(g_inputBox, cursorX, cursorY))
         {
             g_terminal.ActivateInput();
+            SyncTerminalUiRuntimeState();
             DebugLog("DonJ Kenshi Hack : saisie activee par clic.");
             return;
         }
@@ -1373,8 +2222,10 @@ namespace
         if (IsPointInsideWidget(g_executeButton, cursorX, cursorY))
         {
             g_terminal.ActivateInput();
+            SyncTerminalUiRuntimeState();
             if (g_terminal.SubmitCurrentInput())
             {
+                SyncTerminalUiRuntimeState();
                 DebugLog("DonJ Kenshi Hack : commande soumise par le bouton Executer.");
             }
             else
@@ -1386,6 +2237,15 @@ namespace
 
     void ProcessTerminalKeyboardInput()
     {
+        SyncTerminalUiRuntimeState();
+        if (!DonJTerminalUiBootstrap::ShouldCaptureKeyboard(
+                g_terminalUiState.windowCreated,
+                g_terminalUiState.consoleVisible))
+        {
+            ConsumePrintableKeys(false);
+            return;
+        }
+
         const bool enterPressed = ConsumeVirtualKeyPress(VK_RETURN);
         const bool escapePressed = ConsumeVirtualKeyPress(VK_ESCAPE);
         const bool backspacePressed = ConsumeVirtualKeyPress(VK_BACK);
@@ -1395,6 +2255,7 @@ namespace
         if (escapePressed && g_terminal.IsInputActive())
         {
             g_terminal.CancelInput();
+            SyncTerminalUiRuntimeState();
             DebugLog("DonJ Kenshi Hack : saisie annulee.");
             ConsumePrintableKeys(false);
             return;
@@ -1411,10 +2272,12 @@ namespace
             if (!g_terminal.IsInputActive())
             {
                 g_terminal.ActivateInput();
+                SyncTerminalUiRuntimeState();
                 DebugTrace("DonJ Kenshi Hack : saisie activee.");
             }
             else if (g_terminal.SubmitCurrentInput())
             {
+                SyncTerminalUiRuntimeState();
                 DebugTrace("DonJ Kenshi Hack : commande soumise.");
             }
             else
@@ -1435,32 +2298,85 @@ namespace
         if (backspacePressed)
         {
             g_terminal.BackspaceInput();
+            SyncTerminalUiRuntimeState();
         }
 
         if (upPressed)
         {
             g_terminal.NavigateCommandHistory(-1);
+            SyncTerminalUiRuntimeState();
         }
 
         if (downPressed)
         {
             g_terminal.NavigateCommandHistory(1);
+            SyncTerminalUiRuntimeState();
         }
 
         ConsumePrintableKeys(true);
+        SyncTerminalUiRuntimeState();
+    }
+
+    void InputHandler_keyDownEvent_hook(InputHandler* thisptr, OIS::KeyCode keyCode)
+    {
+        InputHandler_keyDownEvent_orig(thisptr, keyCode);
+        SyncExecutionContextState();
+
+        if (!g_inputHandlerKeyObserved)
+        {
+            DebugTrace("[TRACE] InputHandler_keyDownEvent_hook observe.");
+            g_inputHandlerKeyObserved = true;
+        }
+
+        if (keyCode == OIS::KC_F10)
+        {
+            HandleTerminalToggleRequest("InputHandler::keyDownEvent");
+            SyncTerminalUiRuntimeState();
+            if (!g_terminalUiState.consoleVisible)
+            {
+                return;
+            }
+        }
+
+        if (IsGameWorldReady() || g_window == nullptr)
+        {
+            return;
+        }
+
+        ProcessTerminalKeyboardInput();
+        ProcessDeferredTerminalCommands("la saisie menu");
+        RefreshTerminalUi();
     }
 
     TitleScreen* TitleScreen_hook(TitleScreen* thisptr)
     {
         TitleScreen* titleScreen = TitleScreen_orig(thisptr);
-        CreateTerminalUi();
+        SyncExecutionContextState();
+        MaybeBootstrapTerminalUi("TitleScreen::_CONSTRUCTOR", thisptr != nullptr);
         return titleScreen;
+    }
+
+    void TitleScreen_show_hook(TitleScreen* thisptr, bool on)
+    {
+        TitleScreen_show_orig(thisptr, on);
+        SyncExecutionContextState();
+        if (on)
+        {
+            DebugTrace("[TRACE] TitleScreen_show_hook observe.");
+            MaybeBootstrapTerminalUi("TitleScreen::_NV_show", thisptr != nullptr);
+        }
     }
 
     void TitleScreen_update_hook(TitleScreen* thisptr)
     {
         TitleScreen_update_orig(thisptr);
         SyncExecutionContextState();
+        if (!g_titleScreenUpdateObserved)
+        {
+            DebugTrace("[TRACE] TitleScreen_update_hook observe.");
+            g_titleScreenUpdateObserved = true;
+        }
+        MaybeBootstrapTerminalUi("TitleScreen::_NV_update", thisptr != nullptr);
 
         if (g_window == nullptr)
         {
@@ -1476,6 +2392,25 @@ namespace
         }
     }
 
+    void GUIWindow_update_hook(GUIWindow* thisptr)
+    {
+        GUIWindow_update_orig(thisptr);
+        SyncExecutionContextState();
+
+        if (!g_guiWindowUpdateObserved)
+        {
+            DebugTrace("[TRACE] GUIWindow_update_hook observe.");
+            g_guiWindowUpdateObserved = true;
+        }
+
+        if (g_window == nullptr && !IsGameWorldReady())
+        {
+            // La je garde GUIWindow uniquement comme filet de securite de
+            // bootstrap si TitleScreen ne declenche pas la creation sur cette build.
+            MaybeBootstrapTerminalUi("GUIWindow::_NV_update (fallback)", true);
+        }
+    }
+
     void GameWorld_mainLoop_hook(GameWorld* thisptr, float time)
     {
         GameWorld_mainLoop_orig(thisptr, time);
@@ -1488,10 +2423,10 @@ namespace
             TraceArmySessionPoint("game tick debut", sessionBeforeInput);
         }
 
+        ProcessTerminalKeyboardInput();
         if (g_window != nullptr)
         {
             ProcessTerminalMouseInput();
-            ProcessTerminalKeyboardInput();
         }
 
         ProcessDeferredTerminalCommands("le game tick");
@@ -1504,208 +2439,266 @@ namespace
     }
 }
 
+// La j'exporte startPlugin comme dans les exemples KenshiLib, car RE_Kenshi
+// s'appuie sur cette convention d'export C++ pour retrouver l'entree plugin.
 __declspec(dllexport) void startPlugin()
 {
     DeleteFileA(GetArmyTraceFilePath().c_str());
     const std::string buildMarker = BuildArmyBuildMarker();
     WriteCrashSafeArmyTrace(buildMarker);
     DebugLog(buildMarker.c_str());
+#if (_MSC_VER != 1600)
+    DebugTrace("[WARN] Build toolset : ce plugin tourne avec un compilateur MSVC moderne, pas avec Visual C++ 2010.");
+#endif
 
-    g_terminal.SetArmyCommandEnvironment({
-        []() { return IsArmyGameLoaded(); },
-        []() { return HasResolvableArmyLeader(); },
-        []() { return AreArmyTemplatesConfigured(); },
-        []() { return IsArmySpawnSystemInitialized(); },
-        [](const std::string& message)
+    ArmyCommandEnvironment armyCommandEnvironment;
+    armyCommandEnvironment.isGameLoaded = []() { return IsArmyGameLoaded(); };
+    armyCommandEnvironment.hasResolvableLeader = []() { return HasResolvableArmyLeader(); };
+    armyCommandEnvironment.areArmyTemplatesAvailable = []() { return AreArmyTemplatesConfigured(); };
+    armyCommandEnvironment.isSpawnSystemReady = []() { return IsArmySpawnSystemInitialized(); };
+    armyCommandEnvironment.debugTrace = [](const std::string& message) { DebugTrace(message); };
+    armyCommandEnvironment.isFactoryAvailable = []() { return IsArmyFactoryAvailable(); };
+    armyCommandEnvironment.isReplayHookInstalled = []() { return IsArmyReplayHookInstalled(); };
+    g_terminal.SetArmyCommandEnvironment(armyCommandEnvironment);
+
+    SpawnManagerEnvironment spawnManagerEnvironment;
+    spawnManagerEnvironment.isGameLoaded = []() { return IsArmyGameLoaded(); };
+    spawnManagerEnvironment.isFactoryAvailable = []() { return IsArmyFactoryAvailable(); };
+    spawnManagerEnvironment.isReplayHookInstalled = []() { return IsArmyReplayHookInstalled(); };
+    spawnManagerEnvironment.hasNaturalSpawnOpportunity = []() { return HasNaturalArmySpawnOpportunity(); };
+    spawnManagerEnvironment.resolveTemplate = [](const std::string& templateName) -> void*
+    {
+        return ResolveArmyTemplateByName(templateName);
+    };
+    spawnManagerEnvironment.resolvePlayerFaction = []() -> Faction*
+    {
+        return ResolveArmyPlayerFaction();
+    };
+    spawnManagerEnvironment.resolveSpawnOrigin = [](SpawnPosition& outPosition) -> bool
+    {
+        return TryResolveArmySpawnOrigin(outPosition);
+    };
+    spawnManagerEnvironment.trySpawnThroughFactory = [](const SpawnRequest& request, void* resolvedTemplate, Faction* playerFaction, const SpawnPosition& spawnOrigin) -> SpawnAttemptResult
+    {
+        return TrySpawnArmyUnitThroughFactory(request, resolvedTemplate, playerFaction, spawnOrigin);
+    };
+    spawnManagerEnvironment.onUnitSpawned = [](ArmySession& session, const SpawnRequest& request, Character* character) -> bool
+    {
+        return g_armyRuntime.ConfigureSpawnedUnit(session, request, character);
+    };
+    spawnManagerEnvironment.logInfo = [](const std::string& message)
+    {
+        WriteInfoToTerminalAndDebug(message);
+    };
+    spawnManagerEnvironment.logError = [](const std::string& message)
+    {
+        WriteErrorToTerminalAndDebug(message);
+    };
+    spawnManagerEnvironment.traceDebug = [](const std::string& message)
+    {
+        DebugTrace(message);
+    };
+    g_spawnManager.SetEnvironment(spawnManagerEnvironment);
+
+    ArmyRuntimeEnvironment armyRuntimeEnvironment;
+    armyRuntimeEnvironment.isGameLoaded = []() { return IsArmyGameLoaded(); };
+    armyRuntimeEnvironment.resolveLeader = []() -> Character*
+    {
+        return ResolveArmyLeaderCharacter();
+    };
+    armyRuntimeEnvironment.resolveCurrentPlayerPlatoon = []() -> Platoon*
+    {
+        return GetCurrentArmyPlayerPlatoon();
+    };
+    armyRuntimeEnvironment.resolveActivePlatoon = [](Platoon* platoon) -> ActivePlatoon*
+    {
+        return platoon != nullptr ? platoon->getActivePlatoon() : nullptr;
+    };
+    armyRuntimeEnvironment.resolvePlayerFaction = []() -> Faction*
+    {
+        return ResolveArmyPlayerFaction();
+    };
+    armyRuntimeEnvironment.resolveLeaderFaction = [](Character* leader) -> Faction*
+    {
+        Faction* resolvedOwner = nullptr;
+        unsigned int ownerExceptionCode = 0;
+        if (!TryReadArmyCharacterOwnerNoCrash(leader, resolvedOwner, ownerExceptionCode))
         {
-            DebugTrace(message);
+            DebugTraceFormat(
+                "[TRACE] resolveLeaderFaction : owner inaccessible, exception 0x%08X.",
+                ownerExceptionCode);
+            return static_cast<Faction*>(nullptr);
         }
-    });
 
-    g_spawnManager.SetEnvironment({
-        []() { return IsArmyGameLoaded(); },
-        []() { return IsArmyFactoryAvailable(); },
-        []() { return IsArmyReplayHookInstalled(); },
-        []() { return HasNaturalArmySpawnOpportunity(); },
-        [](const std::string& templateName) -> void*
+        return resolvedOwner;
+    };
+    armyRuntimeEnvironment.getCharacterHandleId = [](Character* character) -> ArmyHandleId
+    {
+        ArmyHandleId handleId = 0;
+        unsigned int handleExceptionCode = 0;
+        if (!TryRegisterArmyHandleIdNoCrash(character, handleId, handleExceptionCode))
         {
-            return ResolveArmyTemplateByName(templateName);
-        },
-        []() -> Faction*
-        {
-            return ResolveArmyPlayerFaction();
-        },
-        [](SpawnPosition& outPosition) -> bool
-        {
-            return TryResolveArmySpawnOrigin(outPosition);
-        },
-        [](const SpawnRequest& request, void* resolvedTemplate, Faction* playerFaction, const SpawnPosition& spawnOrigin) -> SpawnAttemptResult
-        {
-            return TrySpawnArmyUnitThroughFactory(request, resolvedTemplate, playerFaction, spawnOrigin);
-        },
-        [](ArmySession& session, const SpawnRequest& request, Character* character) -> bool
-        {
-            return g_armyRuntime.ConfigureSpawnedUnit(session, request, character);
-        },
-        [](const std::string& message)
-        {
-            WriteInfoToTerminalAndDebug(message);
-        },
-        [](const std::string& message)
-        {
-            WriteErrorToTerminalAndDebug(message);
-        },
-        [](const std::string& message)
-        {
-            DebugTrace(message);
+            DebugTraceFormat(
+                "[TRACE] getCharacterHandleId : exception structuree 0x%08X.",
+                handleExceptionCode);
+            return 0;
         }
-    });
 
-    g_armyRuntime.SetEnvironment({
-        []() { return IsArmyGameLoaded(); },
-        []() -> Character*
+        return handleId;
+    };
+    armyRuntimeEnvironment.getPlatoonHandleId = [](Platoon* platoon) -> ArmyHandleId
+    {
+        // La je garde une identite de platoon purement locale a la session.
+        // Je n'ai pas besoin d'un hand serialisable ici, juste d'un identifiant
+        // stable tant que le platoon reste vivant, ce qui evite une conversion
+        // runtime dangereuse via hand(platoon) sur cette build.
+        return MakeRuntimePointerIdentity(platoon);
+    };
+    armyRuntimeEnvironment.resolveCharacterHandleId = [](ArmyHandleId handleId) -> Character*
+    {
+        return ResolveArmyCharacterHandleId(handleId);
+    };
+    armyRuntimeEnvironment.isCharacterDead = [](Character* character) -> bool
+    {
+        return IsArmyCharacterDeadSafe(character);
+    };
+    armyRuntimeEnvironment.isCharacterUnconscious = [](Character* character) -> bool
+    {
+        return IsArmyCharacterUnconsciousSafe(character);
+    };
+    armyRuntimeEnvironment.getCharacterPosition = [](Character* character) -> SpawnPosition
+    {
+        return GetArmyCharacterPosition(character);
+    };
+    armyRuntimeEnvironment.applyFaction = [](Character* character, Faction* faction, ActivePlatoon* platoon)
+    {
+        ApplyArmyFaction(character, faction, platoon);
+    };
+    armyRuntimeEnvironment.renameCharacter = [](Character* character, const std::string& name)
+    {
+        RenameArmyCharacter(character, name);
+    };
+    armyRuntimeEnvironment.teleportCharacter = [](Character* character, const SpawnPosition& position)
+    {
+        TeleportArmyCharacter(character, position);
+    };
+    armyRuntimeEnvironment.setFollowTarget = [](Character* character, Character* leader)
+    {
+        SetArmyFollowTarget(character, leader);
+    };
+    armyRuntimeEnvironment.setEscortOrder = [](Character* character, ArmyEscortOrder order)
+    {
+        ApplyArmyEscortOrder(character, order);
+    };
+    armyRuntimeEnvironment.setEscortRole = [](Character* character)
+    {
+        SetArmyEscortRole(character);
+    };
+    armyRuntimeEnvironment.rethinkAi = [](Character* character)
+    {
+        RethinkArmyAi(character);
+    };
+    armyRuntimeEnvironment.logInfo = [](const std::string& message)
+    {
+        WriteInfoToTerminalAndDebug(message);
+    };
+    armyRuntimeEnvironment.logError = [](const std::string& message)
+    {
+        WriteErrorToTerminalAndDebug(message);
+    };
+    armyRuntimeEnvironment.traceDebug = [](const std::string& message)
+    {
+        DebugTrace(message);
+    };
+    armyRuntimeEnvironment.resolveLeaderHandleId = []() -> ArmyHandleId
+    {
+        return ResolveArmyLeaderHandleId();
+    };
+    armyRuntimeEnvironment.dismissCharacter = [](Character* character)
+    {
+        unsigned int dismissExceptionCode = 0;
+        if (!TryDismissArmyCharacterNoCrash(character, dismissExceptionCode))
         {
-            return ResolveArmyLeaderCharacter();
-        },
-        []() -> Platoon*
-        {
-            return GetCurrentArmyPlayerPlatoon();
-        },
-        [](Platoon* platoon) -> ActivePlatoon*
-        {
-            return platoon != nullptr ? platoon->getActivePlatoon() : nullptr;
-        },
-        []() -> Faction*
-        {
-            return ResolveArmyPlayerFaction();
-        },
-        [](Character* leader) -> Faction*
-        {
-            return leader != nullptr ? leader->owner : nullptr;
-        },
-        [](Character* character) -> ArmyHandleId
-        {
-            return character != nullptr ? RegisterArmyHandleId(character->getHandle()) : 0;
-        },
-        [](Platoon* platoon) -> ArmyHandleId
-        {
-            // La je garde une identite de platoon purement locale a la session.
-            // Je n'ai pas besoin d'un hand serialisable ici, juste d'un identifiant
-            // stable tant que le platoon reste vivant, ce qui evite une conversion
-            // runtime dangereuse via hand(platoon) sur cette build.
-            return MakeRuntimePointerIdentity(platoon);
-        },
-        [](ArmyHandleId handleId) -> Character*
-        {
-            return ResolveArmyCharacterHandleId(handleId);
-        },
-        [](Character* character) -> bool
-        {
-            return character == nullptr || character->isDead();
-        },
-        [](Character* character) -> bool
-        {
-            return character != nullptr && character->isUnconcious();
-        },
-        [](Character* character) -> SpawnPosition
-        {
-            return GetArmyCharacterPosition(character);
-        },
-        [](Character* character, Faction* faction, ActivePlatoon* platoon)
-        {
-            ApplyArmyFaction(character, faction, platoon);
-        },
-        [](Character* character, const std::string& name)
-        {
-            RenameArmyCharacter(character, name);
-        },
-        [](Character* character, const SpawnPosition& position)
-        {
-            TeleportArmyCharacter(character, position);
-        },
-        [](Character* character, Character* leader)
-        {
-            SetArmyFollowTarget(character, leader);
-        },
-        [](Character* character, ArmyEscortOrder order)
-        {
-            ApplyArmyEscortOrder(character, order);
-        },
-        [](Character* character)
-        {
-            SetArmyEscortRole(character);
-        },
-        [](Character* character)
-        {
-            RethinkArmyAi(character);
-        },
-        [](const std::string& message)
-        {
-            WriteInfoToTerminalAndDebug(message);
-        },
-        [](const std::string& message)
-        {
-            WriteErrorToTerminalAndDebug(message);
-        },
-        [](const std::string& message)
-        {
-            DebugTrace(message);
-        },
-        []() -> ArmyHandleId
-        {
-            return ResolveArmyLeaderHandleId();
-        },
-        [](Character* character)
-        {
-            unsigned int dismissExceptionCode = 0;
-            if (!TryDismissArmyCharacterNoCrash(character, dismissExceptionCode))
-            {
-                DebugTraceFormat(
-                    "[TRACE] DismissArmyCharacter exception structuree | code=0x%08X | character=%p",
-                    dismissExceptionCode,
-                    static_cast<void*>(character));
-            }
+            DebugTraceFormat(
+                "[TRACE] DismissArmyCharacter exception structuree | code=0x%08X | character=%p",
+                dismissExceptionCode,
+                static_cast<void*>(character));
         }
-    });
+    };
+    g_armyRuntime.SetEnvironment(armyRuntimeEnvironment);
 
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
-            KenshiLib::GetRealAddress(&TitleScreen::_CONSTRUCTOR),
+    if (!InstallArmyHookFromRva(
+            "TitleScreen::_CONSTRUCTOR",
+            DonJHookAddressResolver::kTitleScreenConstructorRva,
             TitleScreen_hook,
-            &TitleScreen_orig))
+            &TitleScreen_orig,
+            false))
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook TitleScreen::_CONSTRUCTOR.");
-        return;
     }
 
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
-            KenshiLib::GetRealAddress(&TitleScreen::_NV_update),
+    if (!InstallArmyHookFromRva(
+            "TitleScreen::_NV_show",
+            DonJHookAddressResolver::kTitleScreenShowRva,
+            TitleScreen_show_hook,
+            &TitleScreen_show_orig,
+            false))
+    {
+        ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook TitleScreen::_NV_show.");
+    }
+
+    if (!InstallArmyHookFromRva(
+            "TitleScreen::_NV_update",
+            DonJHookAddressResolver::kTitleScreenUpdateRva,
             TitleScreen_update_hook,
-            &TitleScreen_update_orig))
+            &TitleScreen_update_orig,
+            true))
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook TitleScreen::_NV_update.");
         return;
     }
 
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
-            KenshiLib::GetRealAddress(&GameWorld::_NV_mainLoop_GPUSensitiveStuff),
+    if (!InstallArmyHookFromRva(
+            "GUIWindow::_NV_update",
+            DonJHookAddressResolver::kGuiWindowUpdateRva,
+            GUIWindow_update_hook,
+            &GUIWindow_update_orig,
+            false))
+    {
+        ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook GUIWindow::_NV_update.");
+    }
+
+    if (!InstallArmyHookFromRva(
+            "InputHandler::keyDownEvent",
+            DonJHookAddressResolver::kInputHandlerKeyDownEventRva,
+            InputHandler_keyDownEvent_hook,
+            &InputHandler_keyDownEvent_orig,
+            false))
+    {
+        ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook InputHandler::keyDownEvent.");
+    }
+
+    if (!InstallArmyHookFromRva(
+            "GameWorld::_NV_mainLoop_GPUSensitiveStuff",
+            DonJHookAddressResolver::kGameWorldMainLoopRva,
             GameWorld_mainLoop_hook,
-            &GameWorld_mainLoop_orig))
+            &GameWorld_mainLoop_orig,
+            true))
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook GameWorld::_NV_mainLoop_GPUSensitiveStuff.");
         return;
     }
 
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
-            KenshiLib::GetRealAddress(&RootObjectFactory::createRandomCharacter),
+    if (!InstallArmyHookFromRva(
+            "RootObjectFactory::createRandomCharacter",
+            DonJHookAddressResolver::kCreateRandomCharacterRva,
             RootObjectFactory_createRandomCharacter_hook,
-            &RootObjectFactory_createRandomCharacter_orig))
+            &RootObjectFactory_createRandomCharacter_orig,
+            false))
     {
         ErrorLog("DonJ Kenshi Hack : impossible d'installer le hook RootObjectFactory::createRandomCharacter.");
     }
-    else
-    {
-        DebugLog("DonJ Kenshi Hack : hook RootObjectFactory::createRandomCharacter installe.");
-    }
 
-    DebugLog("DonJ Kenshi Hack : hooks constructeur, update et game tick installes.");
+    ResetTerminalUiBootstrapState("start plugin");
+    DebugLog("DonJ Kenshi Hack : hooks TitleScreen et game tick installes.");
 }

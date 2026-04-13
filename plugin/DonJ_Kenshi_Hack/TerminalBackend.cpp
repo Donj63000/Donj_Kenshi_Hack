@@ -8,7 +8,7 @@
 
 namespace
 {
-    const char* ToGameplayCommandLabel(GameplayCommandType type)
+    const char* ToGameplayCommandLabel(GameplayCommandType::Type type)
     {
         switch (type)
         {
@@ -31,6 +31,7 @@ namespace
             << ", unites=" << session.spawnedCount << " / " << targetUnitCount
             << ", spawned=" << session.spawnedCount
             << ", pending=" << session.pendingRequestCount
+            << ", pending_finalize=" << session.pendingFinalizeUnits.size()
             << ", active_units=" << session.activeUnits.size()
             << ", active_handles=" << session.activeUnitHandleIds.size()
             << ", wave=" << session.currentWaveTarget
@@ -54,6 +55,12 @@ namespace
 }
 
 TerminalBackend::TerminalBackend()
+    : maxOutputLines_(64)
+    , commandHistoryCursor_(0)
+    , commandHistoryBrowsing_(false)
+    , inputActive_(false)
+    , outputDirty_(true)
+    , inputDirty_(true)
 {
     RegisterBuiltinCommands();
 
@@ -185,7 +192,7 @@ bool TerminalBackend::SubmitCurrentInput()
         std::string("[TRACE] input_submit_called | line=") +
             line +
             " | pending_ui_before=" +
-            std::to_string(pendingCommands_.size()));
+            DonjToString(pendingCommands_.size()));
 
     commandHistoryBrowsing_ = false;
     commandHistoryCursor_ = commandHistory_.size();
@@ -203,13 +210,13 @@ bool TerminalBackend::SubmitCurrentInput()
     commandHistoryCursor_ = commandHistory_.size();
 
     AppendOutputLine("> " + line);
-    QueuePendingCommand({ line });
+    QueuePendingCommand(PendingCommand(line));
     TraceDebug(
         armyEnvironment_,
         std::string("[TRACE] input_submit_success | line=") +
             line +
             " | pending_ui_after=" +
-            std::to_string(pendingCommands_.size()));
+            DonjToString(pendingCommands_.size()));
     return true;
 }
 
@@ -234,14 +241,14 @@ std::string TerminalBackend::BuildOutputText() const
     std::ostringstream builder;
 
     bool firstLine = true;
-    for (const std::string& line : outputHistory_)
+    for (std::size_t index = 0; index < outputHistory_.size(); ++index)
     {
         if (!firstLine)
         {
             builder << '\n';
         }
 
-        builder << line;
+        builder << outputHistory_[index];
         firstLine = false;
     }
 
@@ -286,7 +293,7 @@ size_t TerminalBackend::ProcessPendingCommands(size_t maxCommandsToProcess)
             std::string("[TRACE] ui_command_dequeued | line=") +
                 command.rawLine +
                 " | pending_ui_after_pop=" +
-                std::to_string(pendingCommands_.size()));
+                DonjToString(pendingCommands_.size()));
         ExecuteLine(command.rawLine);
         ++processedCount;
     }
@@ -372,7 +379,7 @@ void TerminalBackend::SetArmyCommandEnvironment(const ArmyCommandEnvironment& en
 
 void TerminalBackend::RegisterBuiltinCommands()
 {
-    commandRegistry_.Register({
+    commandRegistry_.Register(RegisteredCommand(
         "help",
         "/help - liste les commandes disponibles.",
         [](const CommandContext& context, const std::vector<std::string>&)
@@ -383,9 +390,9 @@ void TerminalBackend::RegisterBuiltinCommands()
             context.writeLine(" - /army : prepare 30 allies temporaires pour 180 secondes.");
             context.writeLine(" - /armytest <1..30> : lance une invocation de validation avec un plus petit volume.");
             context.writeLine(" - /dismiss : force la dissolution de l'armee active.");
-        } });
+        }));
 
-    commandRegistry_.Register({
+    commandRegistry_.Register(RegisteredCommand(
         "status",
         "/status - affiche l'etat courant du terminal.",
         [](const CommandContext& context, const std::vector<std::string>&)
@@ -396,14 +403,14 @@ void TerminalBackend::RegisterBuiltinCommands()
             gameplayQueueLine << "[INFO] Commandes gameplay en attente : " << context.getPendingGameplayCommandCount() << '.';
             context.writeLine(gameplayQueueLine.str());
             context.writeLine(BuildArmyStatusLine(session));
-        } });
+        }));
 
-    commandRegistry_.Register({
+    commandRegistry_.Register(RegisteredCommand(
         "army",
         "/army - prepare 30 allies temporaires pour 180 secondes.",
         [this](const CommandContext& context, const std::vector<std::string>&)
         {
-            const ArmyPreflightCode preflightCode = EvaluateArmyPreflight();
+            const ArmyPreflightCode::Type preflightCode = EvaluateArmyPreflight();
             if (preflightCode != ArmyPreflightCode::Ok)
             {
                 context.writeLine(ToPreflightMessage(preflightCode));
@@ -412,14 +419,14 @@ void TerminalBackend::RegisterBuiltinCommands()
             }
 
             QueueArmyInvocation(context, GetArmyCommandSpec().unitCount, GetArmyCommandSpec().durationSeconds, false);
-        } });
+        }));
 
-    commandRegistry_.Register({
+    commandRegistry_.Register(RegisteredCommand(
         "armytest",
         "/armytest <1..30> - prepare une invocation de validation.",
         [this](const CommandContext& context, const std::vector<std::string>& args)
         {
-            const ArmyPreflightCode preflightCode = EvaluateArmyPreflight();
+            const ArmyPreflightCode::Type preflightCode = EvaluateArmyPreflight();
             if (preflightCode != ArmyPreflightCode::Ok)
             {
                 context.writeLine(ToPreflightMessage(preflightCode));
@@ -442,9 +449,9 @@ void TerminalBackend::RegisterBuiltinCommands()
 
             requestedCount = std::max(1, std::min(30, requestedCount));
             QueueArmyInvocation(context, requestedCount, GetArmyCommandSpec().durationSeconds, true);
-        } });
+        }));
 
-    commandRegistry_.Register({
+    commandRegistry_.Register(RegisteredCommand(
         "dismiss",
         "/dismiss - force la dissolution de l'armee active.",
         [this](const CommandContext& context, const std::vector<std::string>&)
@@ -460,7 +467,7 @@ void TerminalBackend::RegisterBuiltinCommands()
             gameplayCommand.type = GameplayCommandType::DismissArmy;
             context.enqueueGameplayCommand(gameplayCommand);
             context.writeLine("[OK] /dismiss : nettoyage force programme.");
-        } });
+        }));
 }
 
 void TerminalBackend::ExecuteLine(const std::string& line)
@@ -495,39 +502,38 @@ void TerminalBackend::ExecuteLine(const std::string& line)
         args.assign(tokens.begin() + 1, tokens.end());
     }
 
-    const CommandContext context = {
-        [this](const std::string& outputLine)
-        {
-            AppendOutputLine(outputLine);
-        },
-        [this](const GameplayCommand& commandToQueue)
-        {
-            QueueGameplayCommand(commandToQueue);
-        },
-        [this]() -> ArmySession&
-        {
-            return armySession_;
-        },
-        [this]() -> size_t
-        {
-            return gameplayCommandQueue_.size();
-        },
-        [this]() -> bool
-        {
-            return armyEnvironment_.isGameLoaded();
-        },
-        [this]() -> bool
-        {
-            return armyEnvironment_.hasResolvableLeader();
-        },
-        [this]() -> bool
-        {
-            return armyEnvironment_.areArmyTemplatesAvailable();
-        },
-        [this]() -> bool
-        {
-            return armyEnvironment_.isSpawnSystemReady();
-        }
+    CommandContext context;
+    context.writeLine = [this](const std::string& outputLine)
+    {
+        AppendOutputLine(outputLine);
+    };
+    context.enqueueGameplayCommand = [this](const GameplayCommand& commandToQueue)
+    {
+        QueueGameplayCommand(commandToQueue);
+    };
+    context.getArmySession = [this]() -> ArmySession&
+    {
+        return armySession_;
+    };
+    context.getPendingGameplayCommandCount = [this]() -> size_t
+    {
+        return gameplayCommandQueue_.size();
+    };
+    context.isGameLoaded = [this]() -> bool
+    {
+        return armyEnvironment_.isGameLoaded();
+    };
+    context.hasResolvableLeader = [this]() -> bool
+    {
+        return armyEnvironment_.hasResolvableLeader();
+    };
+    context.areArmyTemplatesAvailable = [this]() -> bool
+    {
+        return armyEnvironment_.areArmyTemplatesAvailable();
+    };
+    context.isSpawnSystemReady = [this]() -> bool
+    {
+        return armyEnvironment_.isSpawnSystemReady();
     };
 
     command->handler(context, args);
@@ -541,7 +547,7 @@ void TerminalBackend::QueueGameplayCommand(const GameplayCommand& command)
         std::string("[TRACE] gameplay_command_enqueued | type=") +
             ToGameplayCommandLabel(command.type) +
             " | pending_gameplay=" +
-            std::to_string(gameplayCommandQueue_.size()));
+            DonjToString(gameplayCommandQueue_.size()));
 }
 
 void TerminalBackend::QueuePendingCommand(const PendingCommand& command)
@@ -605,6 +611,11 @@ void TerminalBackend::TickArmySession(float deltaSeconds)
         return;
     }
 
+    if (!armySession_.pendingFinalizeUnits.empty())
+    {
+        return;
+    }
+
     if (armySession_.remainingSeconds > 0.0f)
     {
         armySession_.remainingSeconds = std::max(0.0f, armySession_.remainingSeconds - deltaSeconds);
@@ -641,7 +652,7 @@ void TerminalBackend::QueueArmyInvocation(const CommandContext& context, int req
     for (int index = 0; index < session.requestedCount; ++index)
     {
         const std::string templateName = spec.templateNames[static_cast<size_t>(index) % spec.templateNames.size()];
-        session.pendingRequests.push_back({ templateName, index });
+        session.pendingRequests.push_back(SpawnRequest(templateName, index));
         gameplayCommand.templateNames.push_back(templateName);
     }
 
@@ -668,7 +679,7 @@ void TerminalBackend::QueueArmyInvocation(const CommandContext& context, int req
             BuildArmySessionDebugLine(session));
 }
 
-ArmyPreflightCode TerminalBackend::EvaluateArmyPreflight() const
+ArmyPreflightCode::Type TerminalBackend::EvaluateArmyPreflight() const
 {
     if (!armyEnvironment_.isGameLoaded())
     {
@@ -693,6 +704,16 @@ ArmyPreflightCode TerminalBackend::EvaluateArmyPreflight() const
     if (!armyEnvironment_.isSpawnSystemReady())
     {
         return ArmyPreflightCode::SpawnSystemUnavailable;
+    }
+
+    if (!armyEnvironment_.isFactoryAvailable())
+    {
+        return ArmyPreflightCode::FactoryUnavailable;
+    }
+
+    if (!armyEnvironment_.isReplayHookInstalled())
+    {
+        return ArmyPreflightCode::ReplayHookUnavailable;
     }
 
     return ArmyPreflightCode::Ok;

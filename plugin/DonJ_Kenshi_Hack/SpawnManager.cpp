@@ -18,7 +18,7 @@ namespace
         }
 
         char buffer[256] = {};
-        std::snprintf(buffer, sizeof(buffer), format, valueA, valueB);
+        DonjSnprintf(buffer, sizeof(buffer), format, valueA, valueB);
         writer(buffer);
     }
 
@@ -29,6 +29,12 @@ namespace
             environment.traceDebug(message);
         }
     }
+}
+
+SpawnManager::SpawnManager()
+    : reminderAccumulator_(0.0f)
+    , populatedAreaHintIssued_(false)
+{
 }
 
 void SpawnManager::SetConfig(const SpawnManagerConfig& config)
@@ -338,10 +344,6 @@ std::size_t SpawnManager::Tick(ArmySession& session, float deltaSeconds)
             }
 
             ++session.spawnedCount;
-            if (result.character != nullptr)
-            {
-                session.activeUnits.push_back(result.character);
-            }
             ++spawnedThisTick;
             reminderAccumulator_ = 0.0f;
             LogWaveProgress(session);
@@ -439,8 +441,9 @@ int SpawnManager::DetermineWaveTarget(const SpawnManagerConfig& config, int requ
         return 0;
     }
 
-    for (int configuredTarget : config.validationWaveTargets)
+    for (std::size_t index = 0; index < config.validationWaveTargets.size(); ++index)
     {
+        const int configuredTarget = config.validationWaveTargets[index];
         const int clampedTarget = std::min(configuredTarget, safeRequestedCount);
         if (clampedTarget > alreadySpawned)
         {

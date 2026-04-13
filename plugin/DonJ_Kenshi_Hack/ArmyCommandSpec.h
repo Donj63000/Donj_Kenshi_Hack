@@ -4,14 +4,19 @@
 
 #include <array>
 
-enum class ArmyPreflightCode
+struct ArmyPreflightCode
 {
-    Ok,
-    GameNotLoaded,
-    LeaderUnavailable,
-    ArmyAlreadyActive,
-    MissingTemplates,
-    SpawnSystemUnavailable
+    enum Type
+    {
+        Ok,
+        GameNotLoaded,
+        LeaderUnavailable,
+        ArmyAlreadyActive,
+        MissingTemplates,
+        SpawnSystemUnavailable,
+        FactoryUnavailable,
+        ReplayHookUnavailable
+    };
 };
 
 struct ArmyCommandSpec
@@ -42,7 +47,7 @@ inline const ArmyCommandSpec& GetArmyCommandSpec()
     return spec;
 }
 
-inline const char* ToStatusLabel(ArmyState state)
+inline const char* ToStatusLabel(ArmyState::Type state)
 {
     switch (state)
     {
@@ -61,7 +66,7 @@ inline const char* ToStatusLabel(ArmyState state)
     }
 }
 
-inline const char* ToPreflightMessage(ArmyPreflightCode code)
+inline const char* ToPreflightMessage(ArmyPreflightCode::Type code)
 {
     switch (code)
     {
@@ -77,6 +82,10 @@ inline const char* ToPreflightMessage(ArmyPreflightCode code)
         return "[ERREUR] Le template DonJ_ArmyOfDead_Warrior est introuvable.";
     case ArmyPreflightCode::SpawnSystemUnavailable:
         return "[INFO] /army refusee : systeme de spawn non initialise.";
+    case ArmyPreflightCode::FactoryUnavailable:
+        return "[INFO] /army refusee : factory Kenshi indisponible.";
+    case ArmyPreflightCode::ReplayHookUnavailable:
+        return "[INFO] /army refusee : hook de replay Kenshi indisponible.";
     default:
         return "[ERREUR] /army refusee : verification inconnue.";
     }

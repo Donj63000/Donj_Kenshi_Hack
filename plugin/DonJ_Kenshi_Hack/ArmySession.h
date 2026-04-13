@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Compatibility.h"
+
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -7,48 +9,104 @@
 
 class Character;
 
-using ArmyHandleId = std::uint64_t;
+typedef std::uint64_t ArmyHandleId;
 
-enum class ArmyState
+struct ArmyState
 {
-    Idle,
-    Preparing,
-    Spawning,
-    Active,
-    Dismissing
+    enum Type
+    {
+        Idle,
+        Preparing,
+        Spawning,
+        Active,
+        Dismissing
+    };
 };
 
 struct SpawnRequest
 {
     std::string templateName;
-    int index = 0;
+    int index;
+
+    SpawnRequest()
+        : index(0)
+    {
+    }
+
+    SpawnRequest(const std::string& templateNameValue, int indexValue)
+        : templateName(templateNameValue)
+        , index(indexValue)
+    {
+    }
+};
+
+struct PendingSpawnFinalize
+{
+    SpawnRequest request;
+    ArmyHandleId handleId;
+    int retryCount;
+
+    PendingSpawnFinalize()
+        : handleId(0)
+        , retryCount(0)
+    {
+    }
+
+    PendingSpawnFinalize(const SpawnRequest& requestValue, ArmyHandleId handleIdValue, int retryCountValue)
+        : request(requestValue)
+        , handleId(handleIdValue)
+        , retryCount(retryCountValue)
+    {
+    }
 };
 
 struct ArmySession
 {
-    ArmyState state = ArmyState::Idle;
-    int requestedCount = 30;
-    int spawnedCount = 0;
-    int pendingRequestCount = 0;
-    int totalSpawnAttempts = 0;
-    int failedSpawnAttempts = 0;
-    int deferredSpawnAttempts = 0;
-    int currentWaveTarget = 0;
-    float durationSeconds = 180.0f;
-    float remainingSeconds = 0.0f;
-    float escortRefreshAccumulator = 0.0f;
-    bool active = false;
-    bool lockOneArmyAtATime = true;
-    bool waitingForReplayOpportunity = false;
-    bool factionBootstrappedFromLeader = false;
-    ArmyHandleId leaderHandleId = 0;
-    ArmyHandleId leaderPlatoonHandleId = 0;
+    ArmyState::Type state;
+    int requestedCount;
+    int spawnedCount;
+    int pendingRequestCount;
+    int totalSpawnAttempts;
+    int failedSpawnAttempts;
+    int deferredSpawnAttempts;
+    int currentWaveTarget;
+    float durationSeconds;
+    float remainingSeconds;
+    float escortRefreshAccumulator;
+    bool active;
+    bool lockOneArmyAtATime;
+    bool waitingForReplayOpportunity;
+    bool factionBootstrappedFromLeader;
+    ArmyHandleId leaderHandleId;
+    ArmyHandleId leaderPlatoonHandleId;
     std::deque<SpawnRequest> pendingRequests;
+    std::deque<PendingSpawnFinalize> pendingFinalizeUnits;
     std::vector<ArmyHandleId> activeUnitHandleIds;
     std::vector<Character*> activeUnits;
+
+    ArmySession()
+        : state(ArmyState::Idle)
+        , requestedCount(30)
+        , spawnedCount(0)
+        , pendingRequestCount(0)
+        , totalSpawnAttempts(0)
+        , failedSpawnAttempts(0)
+        , deferredSpawnAttempts(0)
+        , currentWaveTarget(0)
+        , durationSeconds(180.0f)
+        , remainingSeconds(0.0f)
+        , escortRefreshAccumulator(0.0f)
+        , active(false)
+        , lockOneArmyAtATime(true)
+        , waitingForReplayOpportunity(false)
+        , factionBootstrappedFromLeader(false)
+        , leaderHandleId(0)
+        , leaderPlatoonHandleId(0)
+    {
+    }
 };
 
-inline const char* ToString(ArmyState state)
+inline const char* ToString(ArmyState::Type state)
 {
     switch (state)
     {

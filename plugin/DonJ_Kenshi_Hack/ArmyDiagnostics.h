@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Compatibility.h"
 #include "SpawnManager.h"
 
 #include <cstdio>
@@ -8,15 +9,16 @@
 inline std::string BuildArmySessionDebugLine(const ArmySession& session)
 {
     char buffer[512] = {};
-    std::snprintf(
+    DonjSnprintf(
         buffer,
         sizeof(buffer),
-        "state=%s requested=%d spawned=%d pending=%d queue=%zu active_units=%zu active_handles=%zu wave=%d attempts=%d deferred=%d failed=%d active=%s waiting_replay=%s faction_bootstrap=%s leader=%llu platoon=%llu remaining=%.2fs",
+        "state=%s requested=%d spawned=%d pending=%d queue=%zu pending_finalize=%zu active_units=%zu active_handles=%zu wave=%d attempts=%d deferred=%d failed=%d active=%s waiting_replay=%s faction_bootstrap=%s leader=%llu platoon=%llu remaining=%.2fs",
         ToString(session.state),
         session.requestedCount,
         session.spawnedCount,
         session.pendingRequestCount,
         session.pendingRequests.size(),
+        session.pendingFinalizeUnits.size(),
         session.activeUnits.size(),
         session.activeUnitHandleIds.size(),
         session.currentWaveTarget,
@@ -35,7 +37,7 @@ inline std::string BuildArmySessionDebugLine(const ArmySession& session)
 inline std::string BuildSpawnRequestDebugLine(const SpawnRequest& request)
 {
     char buffer[256] = {};
-    std::snprintf(
+    DonjSnprintf(
         buffer,
         sizeof(buffer),
         "template=%s index=%d",
@@ -47,7 +49,7 @@ inline std::string BuildSpawnRequestDebugLine(const SpawnRequest& request)
 inline std::string BuildSpawnPositionDebugLine(const SpawnPosition& position)
 {
     char buffer[160] = {};
-    std::snprintf(
+    DonjSnprintf(
         buffer,
         sizeof(buffer),
         "(x=%.2f y=%.2f z=%.2f)",
@@ -57,7 +59,7 @@ inline std::string BuildSpawnPositionDebugLine(const SpawnPosition& position)
     return buffer;
 }
 
-inline const char* ToString(SpawnAttemptOutcome outcome)
+inline const char* ToString(SpawnAttemptOutcome::Type outcome)
 {
     switch (outcome)
     {

@@ -7,13 +7,24 @@
 
 struct CommandContext;
 
-using CommandHandler = std::function<void(const CommandContext&, const std::vector<std::string>&)>;
+typedef std::function<void(const CommandContext&, const std::vector<std::string>&)> CommandHandler;
 
 struct RegisteredCommand
 {
     std::string name;
     std::string help;
     CommandHandler handler;
+
+    RegisteredCommand()
+    {
+    }
+
+    RegisteredCommand(const std::string& commandName, const std::string& commandHelp, const CommandHandler& commandHandler)
+        : name(commandName)
+        , help(commandHelp)
+        , handler(commandHandler)
+    {
+    }
 };
 
 class CommandRegistry

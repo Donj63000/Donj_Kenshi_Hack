@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 # La je remonte proprement a la racine du depot depuis plugin\DonJ_Kenshi_Hack.
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $packageDir = Join-Path $repoRoot "package\DonJ_Kenshi_Hack"
-$buildDir = Join-Path $PSScriptRoot "x64\Release"
+$buildDir = Join-Path $PSScriptRoot "x64\Release_v100"
 $modDir = Join-Path $KenshiDir "mods\DonJ_Kenshi_Hack"
 
 $sourceDll = Join-Path $buildDir "DonJ_Kenshi_Hack.dll"
@@ -46,7 +46,8 @@ Copy-Item -LiteralPath $sourceJson -Destination $targetJson -Force
 if ($ResetLogs) {
     foreach ($logPath in @(
         (Join-Path $KenshiDir "RE_Kenshi_log.txt"),
-        (Join-Path $KenshiDir "DonJ_Kenshi_Hack_trace.log")
+        (Join-Path $KenshiDir "DonJ_Kenshi_Hack_trace.log"),
+        (Join-Path $KenshiDir "RE_Kenshi\DonJ_Kenshi_Hack_trace.log")
     )) {
         if (Test-Path -LiteralPath $logPath) {
             Remove-Item -LiteralPath $logPath -Force

@@ -12,6 +12,8 @@ namespace
     constexpr float kRingSpacing = 2.0f;
     constexpr float kMaxTeleportCatchupDistance = 25.0f;
     constexpr float kEscortRefreshIntervalSeconds = 0.50f;
+    constexpr int kMaxDeferredInitPerTick = 1;
+    constexpr int kMaxDeferredInitRetries = 30;
 
     float ComputeDistanceSquared(const SpawnPosition& a, const SpawnPosition& b)
     {
@@ -102,87 +104,31 @@ bool ArmyRuntimeManager::ConfigureSpawnedUnit(ArmySession& session, const SpawnR
         return false;
     }
 
-    Character* leader = environment_.resolveLeader();
-    if (leader == nullptr && session.leaderHandleId != 0)
-    {
-        leader = environment_.resolveCharacterHandleId(session.leaderHandleId);
-    }
-
-    if (leader == nullptr)
-    {
-        environment_.logError("[ERREUR] Post-traitement d'invocation : leader introuvable.");
-        return false;
-    }
-
-    if (session.leaderHandleId == 0 && !CaptureLeaderContext(session))
-    {
-        environment_.logError("[ERREUR] Post-traitement d'invocation : impossible de capturer le contexte du leader.");
-        return false;
-    }
-
-    Faction* faction = environment_.resolvePlayerFaction();
-    if (faction == nullptr)
-    {
-        faction = environment_.resolveLeaderFaction(leader);
-        if (faction != nullptr && !session.factionBootstrappedFromLeader)
-        {
-            session.factionBootstrappedFromLeader = true;
-            environment_.logInfo("[INFO] Faction Bootstrap : faction joueur resolue depuis le leader.");
-        }
-    }
-
-    if (faction == nullptr)
-    {
-        environment_.logError("[ERREUR] Post-traitement d'invocation : faction joueur introuvable.");
-        return false;
-    }
-
-    Platoon* currentPlayerPlatoon = environment_.resolveCurrentPlayerPlatoon();
-    ActivePlatoon* activePlatoon = environment_.resolveActivePlatoon(currentPlayerPlatoon);
-    const SpawnPosition leaderPosition = environment_.getCharacterPosition(leader);
-    const SpawnPosition formationPosition = ComputeFormationPosition(leaderPosition, request.index);
-
-    environment_.applyFaction(character, faction, activePlatoon);
-
-    if (environment_.renameCharacter)
-    {
-        char nameBuffer[96] = {};
-        std::snprintf(
-            nameBuffer,
-            sizeof(nameBuffer),
-            "Armee des morts %02d",
-            request.index + 1);
-        environment_.renameCharacter(character, nameBuffer);
-    }
-
-    environment_.teleportCharacter(character, formationPosition);
-
-    // IMPORTANT :
-    // On ne pousse pas encore les ordres d'escorte ici.
-    // La creation du personnage vient juste d'avoir lieu dans un contexte
-    // factory sensible. On limite donc le post-traitement immediat a :
-    // - faction
-    // - nom
-    // - position
-    //
-    // Les ordres "follow / protect / rethink AI" seront reappliques un peu plus
-    // tard depuis le game tick normal, ce qui reduit fortement le risque de crash.
-    session.escortRefreshAccumulator = kEscortRefreshIntervalSeconds;
-
     const ArmyHandleId characterHandleId = environment_.getCharacterHandleId(character);
     if (characterHandleId != 0)
     {
-        session.activeUnitHandleIds.push_back(characterHandleId);
+        if (session.leaderHandleId == 0)
+        {
+            CaptureLeaderContext(session);
+        }
+
+        PendingSpawnFinalize pendingFinalize;
+        pendingFinalize.request = request;
+        pendingFinalize.handleId = characterHandleId;
+        session.pendingFinalizeUnits.push_back(pendingFinalize);
+
+        char logMessage[256] = {};
+        std::snprintf(
+            logMessage,
+            sizeof(logMessage),
+            "[INFO] Escorte armee : unite %d creee, initialisation differee au prochain tick.",
+            request.index + 1);
+        environment_.logInfo(logMessage);
+        return true;
     }
 
-    char logMessage[256] = {};
-    std::snprintf(
-        logMessage,
-        sizeof(logMessage),
-        "[INFO] Escorte armee : unite %d creee, faction appliquee et positionnee. Escorte differee au tick suivant.",
-        request.index + 1);
-    environment_.logInfo(logMessage);
-    return true;
+    environment_.logError("[ERREUR] Post-traitement d'invocation : handle du personnage introuvable.");
+    return false;
 }
 
 SpawnPosition ArmyRuntimeManager::ComputeFormationPosition(const SpawnPosition& leaderPosition, int formationIndex) const
@@ -236,6 +182,7 @@ void ArmyRuntimeManager::Tick(ArmySession& session, float deltaSeconds)
 
     if (session.state == ArmyState::Spawning &&
         session.spawnedCount == 0 &&
+        session.pendingFinalizeUnits.empty() &&
         session.activeUnits.empty() &&
         session.activeUnitHandleIds.empty())
     {
@@ -261,7 +208,12 @@ void ArmyRuntimeManager::Tick(ArmySession& session, float deltaSeconds)
     }
 
     PruneInactiveUnits(session);
-    if (session.spawnedCount > 0 && session.pendingRequestCount == 0 && session.activeUnitHandleIds.empty())
+    FinalizePendingSpawnUnits(session, leader);
+
+    if (session.spawnedCount > 0 &&
+        session.pendingRequestCount == 0 &&
+        session.pendingFinalizeUnits.empty() &&
+        session.activeUnitHandleIds.empty())
     {
         TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::Tick : plus aucune unite valide, dismiss defensif.");
         BeginDismiss(session, "toutes les invocations ont disparu avant la fin du timer.");
@@ -327,6 +279,113 @@ bool ArmyRuntimeManager::IsLeaderContextStillValid(ArmySession& session, Charact
     return true;
 }
 
+void ArmyRuntimeManager::FinalizePendingSpawnUnits(ArmySession& session, Character* leader) const
+{
+    if (session.pendingFinalizeUnits.empty())
+    {
+        return;
+    }
+
+    int finalizedThisTick = 0;
+    const std::size_t pendingCount = session.pendingFinalizeUnits.size();
+    for (std::size_t pendingIndex = 0;
+         pendingIndex < pendingCount && finalizedThisTick < kMaxDeferredInitPerTick;
+         ++pendingIndex)
+    {
+        PendingSpawnFinalize pendingFinalize = session.pendingFinalizeUnits.front();
+        session.pendingFinalizeUnits.pop_front();
+
+        Character* character = environment_.resolveCharacterHandleId(pendingFinalize.handleId);
+        if (character == nullptr)
+        {
+            ++pendingFinalize.retryCount;
+            if (pendingFinalize.retryCount < kMaxDeferredInitRetries)
+            {
+                session.pendingFinalizeUnits.push_back(pendingFinalize);
+            }
+            else
+            {
+                char errorBuffer[256] = {};
+                std::snprintf(
+                    errorBuffer,
+                    sizeof(errorBuffer),
+                    "[ERREUR] Escorte armee : unite %d introuvable apres %d tentatives de finalisation.",
+                    pendingFinalize.request.index + 1,
+                    pendingFinalize.retryCount);
+                environment_.logError(errorBuffer);
+            }
+            continue;
+        }
+
+        Faction* faction = environment_.resolvePlayerFaction();
+        if (faction == nullptr)
+        {
+            faction = environment_.resolveLeaderFaction(leader);
+            if (faction != nullptr && !session.factionBootstrappedFromLeader)
+            {
+                session.factionBootstrappedFromLeader = true;
+                environment_.logInfo("[INFO] Faction Bootstrap : faction joueur resolue depuis le leader.");
+            }
+        }
+
+        if (faction == nullptr)
+        {
+            ++pendingFinalize.retryCount;
+            if (pendingFinalize.retryCount < kMaxDeferredInitRetries)
+            {
+                session.pendingFinalizeUnits.push_back(pendingFinalize);
+            }
+            else
+            {
+                environment_.logError("[ERREUR] Escorte armee : faction joueur introuvable apres plusieurs retries.");
+            }
+            continue;
+        }
+
+        Platoon* currentPlayerPlatoon = environment_.resolveCurrentPlayerPlatoon();
+        ActivePlatoon* activePlatoon = environment_.resolveActivePlatoon(currentPlayerPlatoon);
+        const SpawnPosition leaderPosition = environment_.getCharacterPosition(leader);
+        const SpawnPosition formationPosition = ComputeFormationPosition(leaderPosition, pendingFinalize.request.index);
+
+        environment_.applyFaction(character, faction, activePlatoon);
+
+        if (environment_.renameCharacter)
+        {
+            char nameBuffer[96] = {};
+            std::snprintf(
+                nameBuffer,
+                sizeof(nameBuffer),
+                "Armee des morts %02d",
+                pendingFinalize.request.index + 1);
+            environment_.renameCharacter(character, nameBuffer);
+        }
+
+        if (environment_.teleportCharacter)
+        {
+            environment_.teleportCharacter(character, formationPosition);
+        }
+
+        if (std::find(session.activeUnitHandleIds.begin(), session.activeUnitHandleIds.end(), pendingFinalize.handleId) == session.activeUnitHandleIds.end())
+        {
+            session.activeUnitHandleIds.push_back(pendingFinalize.handleId);
+        }
+
+        if (std::find(session.activeUnits.begin(), session.activeUnits.end(), character) == session.activeUnits.end())
+        {
+            session.activeUnits.push_back(character);
+        }
+
+        char infoBuffer[256] = {};
+        std::snprintf(
+            infoBuffer,
+            sizeof(infoBuffer),
+            "[INFO] Escorte armee : unite %d initialisee au tick runtime.",
+            pendingFinalize.request.index + 1);
+        environment_.logInfo(infoBuffer);
+        ++finalizedThisTick;
+    }
+}
+
 void ArmyRuntimeManager::PruneInactiveUnits(ArmySession& session) const
 {
     std::vector<ArmyHandleId> validHandles;
@@ -334,8 +393,9 @@ void ArmyRuntimeManager::PruneInactiveUnits(ArmySession& session) const
     validHandles.reserve(session.activeUnitHandleIds.size());
     validUnits.reserve(session.activeUnitHandleIds.size());
 
-    for (ArmyHandleId handleId : session.activeUnitHandleIds)
+    for (std::size_t index = 0; index < session.activeUnitHandleIds.size(); ++index)
     {
+        const ArmyHandleId handleId = session.activeUnitHandleIds[index];
         if (handleId == 0)
         {
             continue;
@@ -434,8 +494,9 @@ void ArmyRuntimeManager::FinalizeDismiss(ArmySession& session)
     std::vector<Character*> charactersToDismiss;
     charactersToDismiss.reserve(session.activeUnitHandleIds.size() + session.activeUnits.size());
 
-    for (ArmyHandleId handleId : session.activeUnitHandleIds)
+    for (std::size_t index = 0; index < session.activeUnitHandleIds.size(); ++index)
     {
+        const ArmyHandleId handleId = session.activeUnitHandleIds[index];
         Character* character = environment_.resolveCharacterHandleId(handleId);
         if (character != nullptr &&
             std::find(charactersToDismiss.begin(), charactersToDismiss.end(), character) == charactersToDismiss.end())
@@ -444,8 +505,20 @@ void ArmyRuntimeManager::FinalizeDismiss(ArmySession& session)
         }
     }
 
-    for (Character* character : session.activeUnits)
+    for (std::size_t index = 0; index < session.activeUnits.size(); ++index)
     {
+        Character* character = session.activeUnits[index];
+        if (character != nullptr &&
+            std::find(charactersToDismiss.begin(), charactersToDismiss.end(), character) == charactersToDismiss.end())
+        {
+            charactersToDismiss.push_back(character);
+        }
+    }
+
+    for (std::size_t index = 0; index < session.pendingFinalizeUnits.size(); ++index)
+    {
+        const PendingSpawnFinalize& pendingFinalize = session.pendingFinalizeUnits[index];
+        Character* character = environment_.resolveCharacterHandleId(pendingFinalize.handleId);
         if (character != nullptr &&
             std::find(charactersToDismiss.begin(), charactersToDismiss.end(), character) == charactersToDismiss.end())
         {
@@ -455,8 +528,9 @@ void ArmyRuntimeManager::FinalizeDismiss(ArmySession& session)
 
     if (environment_.dismissCharacter)
     {
-        for (Character* character : charactersToDismiss)
+        for (std::size_t index = 0; index < charactersToDismiss.size(); ++index)
         {
+            Character* character = charactersToDismiss[index];
             environment_.dismissCharacter(character);
         }
     }
@@ -464,7 +538,7 @@ void ArmyRuntimeManager::FinalizeDismiss(ArmySession& session)
     TraceDebug(
         environment_,
         std::string("[TRACE] ArmyRuntimeManager::FinalizeDismiss : unites a dissoudre=") +
-            std::to_string(charactersToDismiss.size()));
+            DonjToString(charactersToDismiss.size()));
 
     ResetArmySession(session);
     TraceDebug(environment_, "[TRACE] ArmyRuntimeManager::FinalizeDismiss : session reinitialisee.");

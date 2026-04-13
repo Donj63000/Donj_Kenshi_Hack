@@ -9,23 +9,42 @@
 #include <string>
 #include <vector>
 
-enum class GameplayCommandType
+struct GameplayCommandType
 {
-    SummonArmy,
-    DismissArmy
+    enum Type
+    {
+        SummonArmy,
+        DismissArmy
+    };
 };
 
 struct PendingCommand
 {
     std::string rawLine;
+
+    PendingCommand()
+    {
+    }
+
+    PendingCommand(const std::string& rawLineValue)
+        : rawLine(rawLineValue)
+    {
+    }
 };
 
 struct GameplayCommand
 {
-    GameplayCommandType type = GameplayCommandType::SummonArmy;
-    int requestedCount = 0;
-    float durationSeconds = 0.0f;
+    GameplayCommandType::Type type;
+    int requestedCount;
+    float durationSeconds;
     std::vector<std::string> templateNames;
+
+    GameplayCommand()
+        : type(GameplayCommandType::SummonArmy)
+        , requestedCount(0)
+        , durationSeconds(0.0f)
+    {
+    }
 };
 
 struct CommandContext
@@ -42,11 +61,42 @@ struct CommandContext
 
 struct ArmyCommandEnvironment
 {
-    std::function<bool()> isGameLoaded = []() { return true; };
-    std::function<bool()> hasResolvableLeader = []() { return true; };
-    std::function<bool()> areArmyTemplatesAvailable = []() { return true; };
-    std::function<bool()> isSpawnSystemReady = []() { return true; };
-    std::function<void(const std::string&)> debugTrace = [](const std::string&) {};
+    std::function<bool()> isGameLoaded;
+    std::function<bool()> hasResolvableLeader;
+    std::function<bool()> areArmyTemplatesAvailable;
+    std::function<bool()> isSpawnSystemReady;
+    std::function<void(const std::string&)> debugTrace;
+    std::function<bool()> isFactoryAvailable;
+    std::function<bool()> isReplayHookInstalled;
+
+    ArmyCommandEnvironment()
+        : isGameLoaded([]() { return true; })
+        , hasResolvableLeader([]() { return true; })
+        , areArmyTemplatesAvailable([]() { return true; })
+        , isSpawnSystemReady([]() { return true; })
+        , debugTrace([](const std::string&) {})
+        , isFactoryAvailable([]() { return true; })
+        , isReplayHookInstalled([]() { return true; })
+    {
+    }
+
+    ArmyCommandEnvironment(
+        const std::function<bool()>& isGameLoadedValue,
+        const std::function<bool()>& hasResolvableLeaderValue,
+        const std::function<bool()>& areArmyTemplatesAvailableValue,
+        const std::function<bool()>& isSpawnSystemReadyValue,
+        const std::function<void(const std::string&)>& debugTraceValue = std::function<void(const std::string&)>(),
+        const std::function<bool()>& isFactoryAvailableValue = std::function<bool()>(),
+        const std::function<bool()>& isReplayHookInstalledValue = std::function<bool()>())
+        : isGameLoaded(isGameLoadedValue ? isGameLoadedValue : std::function<bool()>([]() { return true; }))
+        , hasResolvableLeader(hasResolvableLeaderValue ? hasResolvableLeaderValue : std::function<bool()>([]() { return true; }))
+        , areArmyTemplatesAvailable(areArmyTemplatesAvailableValue ? areArmyTemplatesAvailableValue : std::function<bool()>([]() { return true; }))
+        , isSpawnSystemReady(isSpawnSystemReadyValue ? isSpawnSystemReadyValue : std::function<bool()>([]() { return true; }))
+        , debugTrace(debugTraceValue ? debugTraceValue : std::function<void(const std::string&)>([](const std::string&) {}))
+        , isFactoryAvailable(isFactoryAvailableValue ? isFactoryAvailableValue : std::function<bool()>([]() { return true; }))
+        , isReplayHookInstalled(isReplayHookInstalledValue ? isReplayHookInstalledValue : std::function<bool()>([]() { return true; }))
+    {
+    }
 };
 
 class TerminalBackend
@@ -95,7 +145,7 @@ private:
     void QueueGameplayCommand(const GameplayCommand& command);
     void ProcessGameplayCommand(const GameplayCommand& command);
     void TickArmySession(float deltaSeconds);
-    ArmyPreflightCode EvaluateArmyPreflight() const;
+    ArmyPreflightCode::Type EvaluateArmyPreflight() const;
     void QueueArmyInvocation(const CommandContext& context, int requestedCount, float durationSeconds, bool testMode);
 
     static std::string Trim(const std::string& value);
@@ -106,12 +156,12 @@ private:
     std::vector<std::string> commandHistory_;
     std::string historyDraft_;
     std::string inputBuffer_;
-    std::size_t maxOutputLines_ = 64;
-    std::size_t commandHistoryCursor_ = 0;
-    bool commandHistoryBrowsing_ = false;
-    bool inputActive_ = false;
-    bool outputDirty_ = true;
-    bool inputDirty_ = true;
+    std::size_t maxOutputLines_;
+    std::size_t commandHistoryCursor_;
+    bool commandHistoryBrowsing_;
+    bool inputActive_;
+    bool outputDirty_;
+    bool inputDirty_;
 
     CommandRegistry commandRegistry_;
     ArmyCommandEnvironment armyEnvironment_;

@@ -60,8 +60,9 @@ std::vector<const RegisteredCommand*> CommandRegistry::List() const
     std::vector<const RegisteredCommand*> commands;
     commands.reserve(order_.size());
 
-    for (const std::string& name : order_)
+    for (std::size_t index = 0; index < order_.size(); ++index)
     {
+        const std::string& name = order_[index];
         const auto it = commands_.find(name);
         if (it != commands_.end())
         {
